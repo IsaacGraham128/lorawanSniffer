@@ -1132,26 +1132,30 @@ int main(int argc, char **argv)
     int i, j; /* loop and temporary variables */
     int x;
 
-    //struct timespec sleep_time = {0, 3000000}; /* 3 ms */
+    struct timespec sleep_time = {0, 3000}; /* 3 ns */
 
     /* clock and log rotation management */
     // int log_rotate_interval = 3600; /* by default, rotation every hour */
     // int time_check = 0; /* variable used to limit the number of calls to time() function */
-    // unsigned long pkt_in_log = 0; /* count the number of packet written in each log file */
+    unsigned long pkt_in_log = 0; /* count the number of packet written in each log file */
 
     /* configuration file related */
     const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
     const char * conf_fname = defaut_conf_fname; /* pointer to a string we won't touch */
 
     /* allocate memory for packet fetching and processing */
-    // struct lgw_pkt_rx_s rxpkt[16]; /* array containing up to 16 inbound packets metadata */
-    // struct lgw_pkt_rx_s *p; /* pointer on a RX packet */
-    // int nb_pkt;
+    struct lgw_pkt_rx_s rxpkt[16]; /* array containing up to 16 inbound packets metadata */
+    struct lgw_pkt_rx_s *p; /* pointer on a RX packet */
+    int nb_pkt;
 
     /* local timestamp variables until we get accurate GPS time */
-    // struct timespec fetch_time;
-    // char fetch_timestamp[30];
-    // struct tm * x;
+    struct timespec fetch_time;
+    char fetch_timestamp[30];
+    struct tm * xt;
+
+    /* recieved packet variables */
+    uint32_t mote_addr = 0;
+    uint16_t mote_fcnt = 0;
 
     /* parse command line options */
     while( (i = getopt( argc, argv, "hc:" )) != -1 )
@@ -1211,128 +1215,87 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    /* transform the MAC address into a string */
-    // sprintf(lgwm_str, "%08X%08X", (uint32_t)(lgwm >> 32), (uint32_t)(lgwm & 0xFFFFFFFF));
-
-    // /* opening log file and writing CSV header*/
-    // time(&now_time);
+    /* opening log file and writing CSV header*/
+    time(&now_time);
     // open_log();
 
-    // /* main loop */
-    // while ((quit_sig != 1) && (exit_sig != 1)) {
-    //     /* fetch packets */
-    //     nb_pkt = lgw_receive(ARRAY_SIZE(rxpkt), rxpkt);
-    //     if (nb_pkt == LGW_HAL_ERROR) {
-    //         MSG("ERROR: failed packet fetch, exiting\n");
-    //         return EXIT_FAILURE;
-    //     } else if (nb_pkt == 0) {
-    //         clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
-    //     } else {
-    //         /* local timestamp generation until we get accurate GPS time */
-    //         clock_gettime(CLOCK_REALTIME, &fetch_time);
-    //         x = gmtime(&(fetch_time.tv_sec));
-    //         sprintf(fetch_timestamp,"%04i-%02i-%02i %02i:%02i:%02i.%03liZ",(x->tm_year)+1900,(x->tm_mon)+1,x->tm_mday,x->tm_hour,x->tm_min,x->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
-    //     }
+    /* main loop */
+    printf("\n\n");
+    while (!exit_sig && !quit_sig) {
+        /* fetch packets */
+        nb_pkt = lgw_receive(ARRAY_SIZE(rxpkt), rxpkt);
+        if (nb_pkt == LGW_HAL_ERROR) {
+            MSG("ERROR: failed packet fetch, exiting\n");
+            return EXIT_FAILURE;
+        } else if (nb_pkt == 0) {
+            clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
+        } else {
+            /* local timestamp generation until we get accurate GPS time */
+            clock_gettime(CLOCK_REALTIME, &fetch_time);
+            xt = gmtime(&(fetch_time.tv_sec));
+            printf("%04i-%02i-%02i %02i:%02i:%02i.%03liZ\n",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+        }
 
-    //     /* log packets */
-    //     for (i=0; i < nb_pkt; ++i) {
-    //         p = &rxpkt[i];
+        /* log packets */
+        for (i=0; i < nb_pkt; ++i) {
+            p = &rxpkt[i];
 
-    //         /* writing gateway ID */
-    //         fprintf(log_file, "\"%08X%08X\",", (uint32_t)(lgwm >> 32), (uint32_t)(lgwm & 0xFFFFFFFF));
+            /* writing gateway ID */
+            //fprintf(log_file, "\"%08X%08X\",", (uint32_t)(lgwm >> 32), (uint32_t)(lgwm & 0xFFFFFFFF));
 
-    //         /* writing node MAC address */
-    //         fputs("\"\",", log_file); // TODO: need to parse payload
+            /* writing node MAC address */
+            // fputs("\"\",", log_file); // TODO: need to parse payload
 
-    //         /* writing UTC timestamp*/
-    //         fprintf(log_file, "\"%s\",", fetch_timestamp);
-    //         // TODO: replace with GPS time when available
+            // /* writing UTC timestamp*/
+            printf("Packet %d (%ld)\n", i, ++pkt_in_log);
 
-    //         /* writing internal clock */
-    //         fprintf(log_file, "%10u,", p->count_us);
+            /* writing packet status and transmission details*/
+            printf("Status: ");
+            switch(p->status) {
+                case STAT_CRC_OK:       printf("\"CRC_OK\" \n"); break;
+                case STAT_CRC_BAD:      printf("\"CRC_BAD\"\n"); break;
+                case STAT_NO_CRC:       printf("\"NO_CRC\" \n"); break;
+                case STAT_UNDEFINED:    printf("\"UNDEF\"  \n"); break;
+                default:                printf("\"ERR\"    \n");
+            }
 
-    //         /* writing RX frequency */
-    //         fprintf(log_file, "%10u,", p->freq_hz);
+            printf("Reception Details: ");
+            printf("SNR %.1f, SNR_MIN %.1f, SNR_MAX %.1f, RSSI-C %.1f, RSSI-S %.1f\n", p->snr, p->snr_min, p->snr_max, p->rssic, p->rssis);
 
-    //         /* writing RF chain */
-    //         fprintf(log_file, "%u,", p->rf_chain);
+            printf("Channel Details:   ");
+            printf("Channel %1u, Radio %1u, Frequency %.6lfkHz, Modem Id %2u,", p->if_chain, p->rf_chain, ((double)p->freq_hz / 1e6), p->modem_id);
 
-    //         /* writing RX modem/IF chain */
-    //         fprintf(log_file, "%2d,", p->if_chain);
+            printf(" Bandwidth ");
+            switch(p->bandwidth) {
+                case BW_500KHZ:     printf("500kHz,"); break;
+                case BW_250KHZ:     printf("250kHz,"); break;
+                case BW_125KHZ:     printf("125kHz,"); break;
+                case BW_UNDEFINED:  printf("0     ,"); break;
+                default:            printf("-1    ,");
+            }
 
-    //         /* writing status */
-    //         switch(p->status) {
-    //             case STAT_CRC_OK:       fputs("\"CRC_OK\" ,", log_file); break;
-    //             case STAT_CRC_BAD:      fputs("\"CRC_BAD\",", log_file); break;
-    //             case STAT_NO_CRC:       fputs("\"NO_CRC\" ,", log_file); break;
-    //             case STAT_UNDEFINED:    fputs("\"UNDEF\"  ,", log_file); break;
-    //             default:                fputs("\"ERR\"    ,", log_file);
-    //         }
+            printf(" SF ");
+            switch (p->datarate) {
+                case DR_LORA_SF7:   printf("7  "); break;
+                case DR_LORA_SF8:   printf("8  "); break;
+                case DR_LORA_SF9:   printf("9  "); break;
+                case DR_LORA_SF10:  printf("10 "); break;
+                case DR_LORA_SF11:  printf("11 "); break;
+                case DR_LORA_SF12:  printf("12 "); break;
+                default:            printf("ERR");
+            }
+            printf("\n");
 
-    //         /* writing payload size */
-    //         fprintf(log_file, "%3u,", p->size);
+            /* writing packet data */
+            printf("Packet: ");
 
-    //         /* writing modulation */
-    //         switch(p->modulation) {
-    //             case MOD_LORA:  fputs("\"LORA\",", log_file); break;
-    //             case MOD_FSK:   fputs("\"FSK\" ,", log_file); break;
-    //             default:        fputs("\"ERR\" ,", log_file);
-    //         }
 
-    //         /* writing bandwidth */
-    //         switch(p->bandwidth) {
-    //             case BW_500KHZ:     fputs("500000,", log_file); break;
-    //             case BW_250KHZ:     fputs("250000,", log_file); break;
-    //             case BW_125KHZ:     fputs("125000,", log_file); break;
-    //             case BW_UNDEFINED:  fputs("0     ,", log_file); break;
-    //             default:            fputs("-1    ,", log_file);
-    //         }
+            if (i == nb_pkt - 1) {
+                printf("\n\n");
+            }
+        }
 
-    //         /* writing datarate */
-    //         if (p->modulation == MOD_LORA) {
-    //             switch (p->datarate) {
-    //                 case DR_LORA_SF7:   fputs("\"SF7\"   ,", log_file); break;
-    //                 case DR_LORA_SF8:   fputs("\"SF8\"   ,", log_file); break;
-    //                 case DR_LORA_SF9:   fputs("\"SF9\"   ,", log_file); break;
-    //                 case DR_LORA_SF10:  fputs("\"SF10\"  ,", log_file); break;
-    //                 case DR_LORA_SF11:  fputs("\"SF11\"  ,", log_file); break;
-    //                 case DR_LORA_SF12:  fputs("\"SF12\"  ,", log_file); break;
-    //                 default:            fputs("\"ERR\"   ,", log_file);
-    //             }
-    //         } else if (p->modulation == MOD_FSK) {
-    //             fprintf(log_file, "\"%6u\",", p->datarate);
-    //         } else {
-    //             fputs("\"ERR\"   ,", log_file);
-    //         }
-
-    //         /* writing coderate */
-    //         switch (p->coderate) {
-    //             case CR_LORA_4_5:   fputs("\"4/5\",", log_file); break;
-    //             case CR_LORA_4_6:   fputs("\"2/3\",", log_file); break;
-    //             case CR_LORA_4_7:   fputs("\"4/7\",", log_file); break;
-    //             case CR_LORA_4_8:   fputs("\"1/2\",", log_file); break;
-    //             case CR_UNDEFINED:  fputs("\"\"   ,", log_file); break;
-    //             default:            fputs("\"ERR\",", log_file);
-    //         }
-
-    //         /* writing packet RSSI */
-    //         fprintf(log_file, "%+.0f,", p->rssi);
-
-    //         /* writing packet average SNR */
-    //         fprintf(log_file, "%+5.1f,", p->snr);
-
-    //         /* writing hex-encoded payload (bundled in 32-bit words) */
-    //         fputs("\"", log_file);
-    //         for (j = 0; j < p->size; ++j) {
-    //             if ((j > 0) && (j%4 == 0)) fputs("-", log_file);
-    //             fprintf(log_file, "%02X", p->payload[j]);
-    //         }
-
-    //         /* end of log file line */
-    //         fputs("\"\n", log_file);
-    //         fflush(log_file);
-    //         ++pkt_in_log;
-    //     }
+        
 
     //     /* check time and rotate log file if necessary */
     //     ++time_check;
@@ -1346,28 +1309,21 @@ int main(int argc, char **argv)
     //             open_log();
     //         }
     //     }
-    // }
-
-
-    // if (exit_sig == 1) {
-    //     /* clean up before leaving */
-    //     i = lgw_stop();
-    //     if (i == LGW_HAL_SUCCESS) {
-    //         MSG("INFO: concentrator stopped successfully\n");
-    //     } else {
-    //         MSG("WARNING: failed to stop concentrator successfully\n");
-    //     }
-    //     fclose(log_file);
-    //     MSG("INFO: log file %s closed, %lu packet(s) recorded\n", log_file_name, pkt_in_log);
-    // }
-
-    i = lgw_stop();
-    if (i == LGW_HAL_SUCCESS) {
-        MSG("INFO: concentrator stopped successfully\n");
-    } else {
-        MSG("WARNING: failed to stop concentrator successfully\n");
     }
-    MSG("INFO: Exiting packet logger program\n");
+
+
+    if (exit_sig == 1) {
+        /* clean up before leaving */
+        i = lgw_stop();
+        if (i == LGW_HAL_SUCCESS) {
+            MSG("INFO: concentrator stopped successfully\n");
+        } else {
+            MSG("WARNING: failed to stop concentrator successfully\n");
+        }
+        //fclose(log_file);
+        //MSG("INFO: log file %s closed, %lu packet(s) recorded\n", log_file_name, pkt_in_log);
+        MSG("%lu packet(s) recorded\n", pkt_in_log);
+    }
     return EXIT_SUCCESS;
 }
 
