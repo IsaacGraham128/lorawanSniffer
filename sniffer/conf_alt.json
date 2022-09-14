@@ -65,7 +65,7 @@
         "radio_1": {
             "enable": true,
             "type": "SX1250",
-            "freq": 918000000,
+            "freq": 925100000,
             "rssi_offset": -215.4,
             "rssi_tcomp": {"coeff_a": 0, "coeff_b": 0, "coeff_c": 20.41, "coeff_d": 2162.56, "coeff_e": 0},
             "tx_enable": false
@@ -75,13 +75,13 @@
         "chan_multiSF_1": {"enable": true, "radio": 0, "if": -200000},  /* Freq : 917.0 MHz*/
         "chan_multiSF_2": {"enable": true, "radio": 0, "if":  0},       /* Freq : 917.2 MHz*/
         "chan_multiSF_3": {"enable": true, "radio": 0, "if":  200000},  /* Freq : 923.8 MHz*/
-        "chan_multiSF_4": {"enable": true, "radio": 1, "if": -400000},  /* Freq : 917.6 MHz*/
-        "chan_multiSF_5": {"enable": true, "radio": 1, "if": -200000},  /* Freq : 917.8 MHz*/
-        "chan_multiSF_6": {"enable": true, "radio": 1, "if":  0},       /* Freq : 918.0 MHz*/
-        "chan_multiSF_7": {"enable": true, "radio": 1, "if":  200000},  /* Freq : 918.2 MHz*/
-        "chan_Lora_std":  {"enable": true, "radio": 1, "if":  -50000, "bandwidth": 500000, "spread_factor": 8,						/* Freq : 917.5 MHz*/
+        "chan_multiSF_4": {"enable": true, "radio": 1, "if":  0},  /* Freq : 922.9 MHz*/
+        "chan_multiSF_5": {"enable": true, "radio": 1, "if":  0},  /* Freq : 923.1 MHz*/
+        "chan_multiSF_6": {"enable": true, "radio": 1, "if":  0},  /* Freq : 923.5 MHz*/
+        "chan_multiSF_7": {"enable": true, "radio": 1, "if":  0},  /* Freq : 918.7 MHz*/
+        "chan_Lora_std":  {"enable": true, "radio": 1, "if": 0, "bandwidth": 500000, "spread_factor": 12,						/* Freq : 917.5 MHz*/
                            "implicit_hdr": false, "implicit_payload_length": 17, "implicit_crc_en": false, "implicit_coderate": 1},
-        "chan_FSK":       {"enable": true, "radio": 0, "if":  0, "bandwidth": 250000, "datarate": 50000}						    /* Freq : 917.2 MHz*/
+        "chan_FSK":       {"enable": false, "radio": 0, "if":  0, "bandwidth": 250000, "datarate": 50000}						    /* Freq : 917.2 MHz*/
     },
 
     "gateway_conf": {

@@ -144,6 +144,11 @@ static void sig_handler(int sigio) {
     return;
 }
 
+static int find_channel_no(uint32_t freq) {
+    double chan = (freq - 915200000) / 200e3;
+    return (int)chan;
+}
+
 static int parse_SX130x_configuration(const char * conf_file) {
     int i, j, number;
     char param_name[32]; /* used to generate variable parameter names */
@@ -1132,7 +1137,7 @@ int main(int argc, char **argv)
     int i, j; /* loop and temporary variables */
     int x;
 
-    struct timespec sleep_time = {0, 3000}; /* 3 ns */
+    struct timespec sleep_time = {0, 3000000}; /* 3 ms */
 
     /* clock and log rotation management */
     // int log_rotate_interval = 3600; /* by default, rotation every hour */
@@ -1154,9 +1159,15 @@ int main(int argc, char **argv)
     struct tm * xt;
 
     /* recieved packet variables */
+    uint8_t  mote_mhdr = 0;
     uint32_t mote_addr = 0;
+    uint8_t  mote_fctrl = 0;
     uint16_t mote_fcnt = 0;
+    uint8_t  mote_fport = 0;
 
+    /* offset variables */
+    uint8_t mote_fopts_len = 0;
+    
     /* parse command line options */
     while( (i = getopt( argc, argv, "hc:" )) != -1 )
     {
@@ -1263,7 +1274,7 @@ int main(int argc, char **argv)
             printf("SNR %.1f, SNR_MIN %.1f, SNR_MAX %.1f, RSSI-C %.1f, RSSI-S %.1f\n", p->snr, p->snr_min, p->snr_max, p->rssic, p->rssis);
 
             printf("Channel Details:   ");
-            printf("Channel %1u, Radio %1u, Frequency %.6lfkHz, Modem Id %2u,", p->if_chain, p->rf_chain, ((double)p->freq_hz / 1e6), p->modem_id);
+            printf("Channel %1u, Radio %1u, Frequency %.1lfMHz, Modem Id %2u,", p->if_chain, p->rf_chain, ((double)p->freq_hz / 1e6), p->modem_id);
 
             printf(" Bandwidth ");
             switch(p->bandwidth) {
@@ -1284,10 +1295,55 @@ int main(int argc, char **argv)
                 case DR_LORA_SF12:  printf("12 "); break;
                 default:            printf("ERR");
             }
+            printf("AU Channel %d", find_channel_no(p->freq_hz));
             printf("\n");
 
             /* writing packet data */
-            printf("Packet: ");
+            printf("Packet: \n");
+            printf("Size: %dbytes\n", p->size);
+
+            /* Lets find our heading data */
+            mote_mhdr = p->payload[0];
+            mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
+            mote_fctrl = p->payload[5];
+            mote_fcnt = p->payload[6] | p->payload[7] << 8;
+
+            mote_fopts_len = mote_fctrl & 0x0F;
+
+            mote_fport = p->payload[8 + mote_fopts_len];
+
+            printf("MHDR - ");
+            switch(mote_mhdr >> 5) {
+                case 0b000 : printf("Join Request");            break;
+                case 0b001 : printf("Join Accept");             break;
+                case 0b010 : printf("Unconfirmed Data Up");     break;
+                case 0b011 : printf("Unconfirmed Data Down");   break;
+                case 0b100 : printf("Confirmed Data Up");       break;
+                case 0b101 : printf("Confirmed Data Down");     break;
+                case 0b110 : printf("RFU");                     break;
+                case 0b111 : printf("Proprietary");             break;
+            }
+            printf("\n");
+
+            printf("Device Address %d\n", mote_addr);
+
+            printf("ADR %s\n", (mote_fctrl & 0x80) ? "enabled" : "disabled");
+
+            printf("FCnt %d\n", mote_fcnt);
+
+            printf("FOpts were %d bytes long\n", mote_fopts_len);
+
+            printf("Fport was %d ---> ", mote_fport);
+            if (!mote_fport) {
+                printf("Device message is MAC commands only!\n");
+            } else {
+                printf("Device message contains different commands!\n");
+            }
+
+            printf("Payload was ");
+            for (int w = 8 + mote_fopts_len + 1; w < p->size - 4; w++) {
+                printf("%hhx", p->payload[w]);
+            }
 
 
             if (i == nb_pkt - 1) {
