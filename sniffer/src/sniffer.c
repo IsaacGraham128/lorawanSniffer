@@ -75,11 +75,38 @@ Maintainer: Sylvain Miermont
 /* spectral scan */
 typedef struct spectral_scan_s {
     bool enable;            /* enable spectral scan thread */
-    uint32_t freq_hz_start; /* first channel frequency, in Hz */
-    uint8_t nb_chan;        /* number of channels to scan (200kHz between each channel) */
-    uint16_t nb_scan;       /* number of scan points for each frequency scan */
-    uint32_t pace_s;        /* number of seconds between 2 scans in the thread */
+    uint32_t        freq_hz_start;  /* first channel frequency, in Hz */
+    uint8_t         nb_chan;        /* number of channels to scan (200kHz between each channel) */
+    uint16_t        nb_scan;        /* number of scan points for each frequency scan */
+    uint32_t        pace_s;         /* number of seconds between 2 scans in the thread */
 } spectral_scan_t;
+
+/* device management */
+typedef struct lora_device_s {
+    uint32_t        device_adr;
+    uint16_t        fcnt;
+    bool            adr_status;
+} lora_device_t;
+
+/* spreading factor data reading */
+/* backup pointers are used in cases where a realloc is required for more space */
+typedef struct freq_data_s {
+    uint32_t        freq_hz;                        /* Frequency of this spreading factor */
+    uint8_t         sf;                             /* Spreading factor entry */
+    uint16_t        devices_seen;                   /* Number of seen devices */
+    uint16_t        devices_len;                    /* Current length of the devices array */
+    uint16_t        messages_seen;                  /* Number of messages seen */
+    uint16_t        messages_len;                   /* Current length of the RSSI and SNR arrays */
+    uint16_t        unique_messages_seen;           /* Number of messages with unique FCnts */
+    uint32_t        message_last_seen;              /* Timestamp of last message recieved */
+    uint32_t        *devices;                       /* List of device addresses seen */
+    float           *RSSI;                          /* List of RSSI values of recieved messages */
+    float           *SNR;                           /* List of SNR values of recieved messages */
+    bool            realloc;                        /* Flag to indicate the backups are in use due to REALLOC */
+    lora_device_t   *b_devices;                     /* Backup list of devices seen */
+    float           *b_RSSI;                        /* Backup list of RSSI values of recieved messages */
+    float           *b_SNR;                         /* Backup list of SNR values of recieved messages */
+} freq_data_t;
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE VARIABLES (GLOBAL) ------------------------------------------- */
@@ -140,6 +167,7 @@ static uint32_t nb_pkt_received_ref[16];
 static lgw_com_type_t com_type = LGW_COM_USB;
 
 /* Radio configuration structs */
+static bool radio_group_swapping;
 static int radio_group_current; /* Current radio group in use */
 static struct lgw_conf_rxrf_s **rfconf; /* Matrix of radio groups [group][radio config] */
 
@@ -155,6 +183,14 @@ static spectral_scan_t spectral_scan_params = {
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE STATISTIC VARIABLES (GLOBAL) --------------------------------- */
 
+uint16_t devices_seen;
+lora_device_t *devices;
+
+bool realloc_flag;
+uint8_t *confirmed_retransmissions;     /* List of retransmission numbers for confirmed messages */
+uint8_t *unconfirmed_retransmissions;   /* List of retransmission numbers for UNconfirmed messages */
+uint8_t *b_confirmed_retransmissions;   /* Realloc list of retransmission numbers for confirmed messages */
+uint8_t *b_unconfirmed_retransmissions; /* Realloc list of retransmission numbers for UNconfirmed messages */
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DECLARATION ---------------------------------------- */
@@ -162,7 +198,7 @@ static void usage (void);
 
 static void sig_handler(int sigio);
 
-static int find_channel_no(uint32_t freq);
+static uint8_t find_channel_no(uint32_t freq);
 
 static int parse_SX130x_configuration(const char * conf_file);
 
@@ -192,6 +228,9 @@ static void usage( void )
     printf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
+/**
+ * Handle any SIG interrupts.
+ */ 
 static void sig_handler(int sigio) {
     if (sigio == SIGQUIT) {
         quit_sig = true;
@@ -201,9 +240,67 @@ static void sig_handler(int sigio) {
     return;
 }
 
-static int find_channel_no(uint32_t freq) {
+/**
+ * Utility function to find the corresponding channel for a given frequency.
+ * 
+ * @param freq  Frequency to find channel number of
+ * @return      Equivalent channel number
+ */
+static uint8_t find_channel_no(uint32_t freq) {
     double chan = (freq - 915200000) / 200e3;
-    return (int)chan;
+    return (uint8_t)chan;
+}
+
+/**
+ * Wrapper function for starting concentrator. Prints stuff nicely :)
+ * 
+ * @return  -1 on failure, otherwise 0
+ */
+static int start_sniffer(void) {
+    int i;
+
+    i = lgw_start();
+    if (i == LGW_HAL_SUCCESS) {
+        MSG("INFO: concentrator started, packet can now be received\n");
+    } else {
+        MSG("ERROR: failed to start the concentrator\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * Wrapper function for starting concentrator. Prints stuff nicely :)
+ * 
+ * @return  -1 on failure, otherwise 0
+ */
+static int stop_sniffer(void) {
+
+    int i;
+    i = lgw_stop();
+    if (i == LGW_HAL_SUCCESS) {
+        MSG("INFO: concentrator stopped successfully\n");
+    } else {
+        MSG("WARNING: failed to stop concentrator successfully\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
+ * Cleanup function for allocated statistic memory.
+ */
+static void stat_cleanup(void) {
+
+    int i;
+
+    /* cleanup radio configuration */
+    for (i = 0; i < RADIO_GROUP_COUNT; i++)
+        free(rfconf[i]);
+
+    free(rfconf);
 }
 
 /**
@@ -438,6 +535,8 @@ static int parse_SX130x_configuration(const char * conf_file) {
         }
     }
 
+
+
     /* Allocate and initialise memory for the radio information structs and statistics */
     rfconf = (struct lgw_conf_rxrf_s**)calloc(RADIO_GROUP_COUNT, sizeof(struct lgw_conf_rxrf_s*));
     for (i = 0; i < RADIO_GROUP_COUNT; i++) {
@@ -446,6 +545,22 @@ static int parse_SX130x_configuration(const char * conf_file) {
 
     radio_group_current = DEFAULT_GROUP;
 
+    /* Group swapping configuration */
+    val = json_object_dotget_value(conf_obj, "default_group");
+    if (json_value_get_type(val) == JSONBoolean) {
+        radio_group_swapping = (bool)json_value_get_boolean(val);
+        MSG("INFO: Radio group swapping is %s\n", radio_group_swapping ? "enabled" : "disabled");
+    } else {
+        MSG("INFO: No group swapping configuration, assuming false\n");
+    }
+
+    val = json_object_dotget_value(conf_obj, "group_swapping");
+    if (json_value_get_type(val) == JSONBoolean) {
+        radio_group_swapping = (bool)json_value_get_boolean(val);
+        MSG("INFO: Radio group swapping is %s\n", radio_group_swapping ? "enabled" : "disabled");
+    } else {
+        MSG("INFO: No group swapping configuration, assuming false\n");
+    }
 
     /* set configuration for RF chains */
     number = 0;
@@ -504,14 +619,6 @@ static int parse_SX130x_configuration(const char * conf_file) {
 
                 MSG("INFO: Group %d radio %d enabled (type %s), center frequency %u, RSSI offset %f\n", i, j, str, rfconf[i][j].freq_hz, rfconf[i][j].rssi_offset);
             }
-
-
-            // TODO : CONVERT THIS TO A MORE GLOBAL FUNCTION
-            /* all parameters parsed, submitting configuration to the HAL */
-            // if (lgw_rxrf_setconf(i, &rfconf) != LGW_HAL_SUCCESS) {
-            //     MSG("ERROR: invalid configuration for radio %i\n", i);
-            //     return -1;
-            // }
         }
     }
 
@@ -1273,7 +1380,57 @@ void thread_spectral_scan(void) {
 int main(int argc, char **argv) {
 
     /* return management variable */
-    int i;
+    int i, j;
+
+
+
+
+
+
+
+    // int **lmao;
+    // int loopy = 0;
+
+    // int *other;
+
+    // lmao = (int**)calloc(4, sizeof(int*));
+    // for (i = 0; i < 4; i++) {
+    //     lmao[i] = (int*)calloc(4, sizeof(int));
+    //     for (j = 0; j < 4; j++)
+    //         lmao[i][j] = loopy++;
+    // }
+
+    // printf("What do the arrays say?\n");
+
+    // other = (int*)realloc(lmao[1], sizeof(int) * 6);
+
+    // for (i = 0; i < 6; i++) {
+    //     lmao[1][i] = i;
+    // }
+
+    // if (other == NULL)
+    //     printf("Realloc unsuccessful");
+
+    // printf("New pointer is %p\n", other);
+    // printf("Old pointer is %p\n", lmao[1]);
+
+    // for (i = 0; i < 4; i++) {
+    //     printf("Array %d has: ", i);
+    //     if (i == 1) {
+    //         for (j = 0; j < 6; j++) {
+    //             printf("%d ", lmao[i][j]);
+    //         }
+    //     } else {
+    //         for (j = 0; j < 4; j++) {
+    //             printf("%d ", lmao[i][j]);
+    //         }
+    //     }
+        
+    //     printf("\n");
+    // }
+
+    // return EXIT_SUCCESS;
+
 
     /* configuration file related */
     const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
@@ -1341,13 +1498,8 @@ int main(int argc, char **argv) {
     }
 
     /* starting the concentrator */
-    i = lgw_start();
-    if (i == LGW_HAL_SUCCESS) {
-        MSG("INFO: concentrator started, packet can now be received\n");
-    } else {
-        MSG("ERROR: failed to start the concentrator\n");
-        return EXIT_FAILURE;
-    }
+    if (start_sniffer())
+        exit(EXIT_FAILURE);
 
     /* opening log file and writing CSV header*/
     time(&now_time);
@@ -1391,12 +1543,24 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sigact, NULL); /* default "kill" command */
 
     while (!exit_sig && !quit_sig) {
-        // Do nothing but sleep
+        // Sleep, then report once time is up
         wait_ms(1000 * stat_interval);
         pthread_mutex_lock(&mx_concent);
-        printf("Hello there!\n");
-        pthread_mutex_unlock(&mx_concent);
+
+        if (radio_group_swapping) {
+            if (stop_sniffer())
+            exit(EXIT_FAILURE);
+
+            radio_group_current++;
+            radio_group_current %= RADIO_GROUP_COUNT;
+
+            init_radio_group(radio_group_current);
+
+            if (start_sniffer())
+                exit(EXIT_FAILURE);
+        }
         
+        pthread_mutex_unlock(&mx_concent);
     }
 
     /* Get all of our main concentrator listening threads to close */
@@ -1425,12 +1589,8 @@ int main(int argc, char **argv) {
 
     if (exit_sig) {
         /* clean up before leaving */
-        i = lgw_stop();
-        if (i == LGW_HAL_SUCCESS) {
-            MSG("INFO: concentrator stopped successfully\n");
-        } else {
-            MSG("WARNING: failed to stop concentrator successfully\n");
-        }
+        stop_sniffer();
+        stat_cleanup();
     }
     MSG("INFO: Exiting packet sniffer program\n");
     return EXIT_SUCCESS;

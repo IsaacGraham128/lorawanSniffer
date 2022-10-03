@@ -20,6 +20,9 @@
                 "pace_s": 1
             }
         },
+        /* Group swapping configuratio */
+        "group_swapping" : false,
+        "default_group" : 0,
         /* Radio group 0 : This equates to AU sub band 1 */
         "radio_0_0": {
             "enable": true,
@@ -65,7 +68,7 @@
     "gateway_conf": {
         "gateway_ID": "AA555A0000000000",
         /* Reporting interval (in seconds) */
-        "stat_interval": 1800,
+        "stat_interval": 10,
         /* GPS configuration */
         "gps_tty_path": "/dev/ttyS0",
         /* GPS reference coordinates */
