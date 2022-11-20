@@ -14,60 +14,56 @@
             "rssi_offset": 20, /* dB */
             "spectral_scan": {
                 "enable": false,
-                "freq_start": 915200000,
-                "nb_chan": 16,
+                "freq_start": 916800000, //915200000,
+                "nb_chan": 1,
                 "nb_scan": 2000,
                 "pace_s": 1
             }
         },
-        "radio_0": {
+        /* Group swapping configuration */
+        "group_swapping" : false,
+        "default_group" : 1,
+        "radio_groups" : 2,
+        /* Radio group 0 : This equates to AU sub band 1 */
+        "radio_0_0": {
+            "enable": true,
+            "type": "SX1250",
+            "freq": 915600000,
+            "rssi_offset": -215.4,
+            "rssi_tcomp": {"coeff_a": 0, "coeff_b": 0, "coeff_c": 20.41, "coeff_d": 2162.56, "coeff_e": 0}
+        },
+        "radio_0_1": {
+            "enable": true,
+            "type": "SX1250",
+            "freq": 916400000,
+            "rssi_offset": -215.4,
+            "rssi_tcomp": {"coeff_a": 0, "coeff_b": 0, "coeff_c": 20.41, "coeff_d": 2162.56, "coeff_e": 0}
+        },
+        /* Radio group 1 : This equates to AU sub band 2 */
+        "radio_1_0": {
             "enable": true,
             "type": "SX1250",
             "freq": 917200000,
             "rssi_offset": -215.4,
-            "rssi_tcomp": {"coeff_a": 0, "coeff_b": 0, "coeff_c": 20.41, "coeff_d": 2162.56, "coeff_e": 0},
-            "tx_enable": false,
-            "tx_freq_min": 915000000,
-            "tx_freq_max": 928000000,
-            "tx_gain_lut":[
-                {"rf_power": 12, "pa_gain": 1, "pwr_idx": 6},
-                {"rf_power": 13, "pa_gain": 1, "pwr_idx": 7},
-                {"rf_power": 14, "pa_gain": 1, "pwr_idx": 8},
-                {"rf_power": 15, "pa_gain": 1, "pwr_idx": 9},
-                {"rf_power": 16, "pa_gain": 1, "pwr_idx": 10},
-                {"rf_power": 17, "pa_gain": 1, "pwr_idx": 11},
-                {"rf_power": 18, "pa_gain": 1, "pwr_idx": 12},
-                {"rf_power": 19, "pa_gain": 1, "pwr_idx": 13},
-                {"rf_power": 20, "pa_gain": 1, "pwr_idx": 14},
-                {"rf_power": 21, "pa_gain": 1, "pwr_idx": 15},
-                {"rf_power": 22, "pa_gain": 1, "pwr_idx": 16},
-                {"rf_power": 23, "pa_gain": 1, "pwr_idx": 17},
-                {"rf_power": 24, "pa_gain": 1, "pwr_idx": 18},
-                {"rf_power": 25, "pa_gain": 1, "pwr_idx": 19},
-                {"rf_power": 26, "pa_gain": 1, "pwr_idx": 21},
-                {"rf_power": 27, "pa_gain": 1, "pwr_idx": 22}
-            ]
+            "rssi_tcomp": {"coeff_a": 0, "coeff_b": 0, "coeff_c": 20.41, "coeff_d": 2162.56, "coeff_e": 0}
         },
-        "radio_1": {
+        "radio_1_1": {
             "enable": true,
             "type": "SX1250",
             "freq": 918000000,
             "rssi_offset": -215.4,
-            "rssi_tcomp": {"coeff_a": 0, "coeff_b": 0, "coeff_c": 20.41, "coeff_d": 2162.56, "coeff_e": 0},
-            "tx_enable": false
+            "rssi_tcomp": {"coeff_a": 0, "coeff_b": 0, "coeff_c": 20.41, "coeff_d": 2162.56, "coeff_e": 0}
         },
-        "chan_multiSF_All": {"spreading_factor_enable": [ 7, 8, 9, 10, 11, 12 ]},
-        "chan_multiSF_0": {"enable": true, "radio": 0, "if": -400000},  /* Freq : 916.8 MHz*/
-        "chan_multiSF_1": {"enable": true, "radio": 0, "if": -200000},  /* Freq : 917.0 MHz*/
-        "chan_multiSF_2": {"enable": true, "radio": 0, "if":  0},       /* Freq : 917.2 MHz*/
-        "chan_multiSF_3": {"enable": true, "radio": 0, "if":  200000},  /* Freq : 923.8 MHz*/
-        "chan_multiSF_4": {"enable": true, "radio": 1, "if": -400000},  /* Freq : 917.6 MHz*/
-        "chan_multiSF_5": {"enable": true, "radio": 1, "if": -200000},  /* Freq : 917.8 MHz*/
-        "chan_multiSF_6": {"enable": true, "radio": 1, "if":  0},       /* Freq : 918.0 MHz*/
-        "chan_multiSF_7": {"enable": true, "radio": 1, "if":  200000},  /* Freq : 918.2 MHz*/
-        "chan_Lora_std":  {"enable": true, "radio": 1, "if": -500000, "bandwidth": 500000, "spread_factor": 8,						/* Freq : 917.5 MHz*/
-                           "implicit_hdr": false, "implicit_payload_length": 17, "implicit_crc_en": false, "implicit_coderate": 1},
-        "chan_FSK":       {"enable": true, "radio": 0, "if":  0, "bandwidth": 250000, "datarate": 50000}						    /* Freq : 917.2 MHz*/
+        "chan_multiSF_All": {"spreading_factor_enable": [ 7, 8, 9, 10, 11, 12 ]}, /* Group 0, Group 1   */
+        "chan_multiSF_0": {"enable": true, "radio": 0, "if": -400000},  /* Freq : 915.2 or 916.8 MHz*/
+        "chan_multiSF_1": {"enable": true, "radio": 0, "if": -200000},  /* Freq : 915.4 or 917.0 MHz*/
+        "chan_multiSF_2": {"enable": true, "radio": 0, "if":  0},       /* Freq : 915.6 or 917.2 MHz*/
+        "chan_multiSF_3": {"enable": true, "radio": 0, "if":  200000},  /* Freq : 915.8 or 923.8 MHz*/
+        "chan_multiSF_4": {"enable": true, "radio": 1, "if": -400000},  /* Freq : 916.0 or 917.6 MHz*/
+        "chan_multiSF_5": {"enable": true, "radio": 1, "if": -200000},  /* Freq : 916.2 or 917.8 MHz*/
+        "chan_multiSF_6": {"enable": true, "radio": 1, "if":  0},       /* Freq : 916.4 or 918.0 MHz*/
+        "chan_multiSF_7": {"enable": true, "radio": 1, "if":  200000}   /* Freq : 916.6 or 918.2 MHz*/
+
     },
 
     "gateway_conf": {

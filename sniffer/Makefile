@@ -11,6 +11,7 @@ TARGET_USR=pi
 ### Application-specific constants
 
 APP_NAME := sniffer
+JSON_NAME := json_test
 
 ### Environment constants
 
@@ -91,10 +92,20 @@ $(OBJDIR)/%.o: src/%.c $(INCLUDES) | $(OBJDIR)
 
 ### Main program compilation and assembly
 
+all: sniffer json_test
+
 $(OBJDIR)/$(APP_NAME).o: src/$(APP_NAME).c $(LGW_INC) $(INCLUDES) | $(OBJDIR)
 	$(CC) -c $(CFLAGS) $(VFLAG) -I$(LGW_PATH)/inc $< -o $@
 
 $(APP_NAME): $(OBJDIR)/$(APP_NAME).o $(LGW_PATH)/libloragw.a 
+	$(CC) -L$(LGW_PATH) -L$(LIB_PATH) $< -o $@ $(LIBS)
+
+
+### Makefile for JSON testing
+$(OBJDIR)/$(JSON_NAME).o: src/$(JSON_NAME).c $(LGW_INC) $(INCLUDES) | $(OBJDIR)
+	$(CC) -c $(CFLAGS) $(VFLAG) -I$(LGW_PATH)/inc $< -o $@
+
+$(JSON_NAME): $(OBJDIR)/$(JSON_NAME).o $(LGW_PATH)/libloragw.a 
 	$(CC) -L$(LGW_PATH) -L$(LIB_PATH) $< -o $@ $(LIBS)
 
 ### EOF

@@ -34,6 +34,7 @@ Maintainer: Sylvain Miermont
 #include <unistd.h>     /* getopt access */
 #include <stdlib.h>     /* atoi, malloc */
 #include <errno.h>      /* error messages */
+#include <math.h>       /* round */
 
 #include <pthread.h>
 
@@ -56,9 +57,40 @@ Maintainer: Sylvain Miermont
     #define VERSION_STRING "undefined"
 #endif
 
-#define JSON_CONF_DEFAULT   "conf_au_sub2.json"//"conf.json"
-#define JSON_CONF_AU_SUB1   "conf_au_sub1.json"
-#define JSON_CONF_AU_SUB2   "conf_au_sub2.json"
+#define JSON_CONF_DEFAULT   "conf.json"
+
+#define JSON_REPORT_SUFFIX  ".json"
+
+#define JSON_FILE_ED        "ed_data_"
+#define JSON_FILE_CH        "ch_data_"
+
+#define JSON_REPORT_ED      "device"
+#define JSON_REPORT_CH      "channel"
+
+#define JSON_TIME           "@timestamp"
+#define JSON_TYPE           "type"
+#define JSON_DEVADDR        "DevAddr"
+#define JSON_SNR            "SNR"
+#define JSON_RSSI           "RSSI"
+#define JSON_TOA            "ToA"
+#define JSON_ADR            "ADR"
+#define JSON_MTYPE          "MType"
+#define JSON_CRC            "CRC"
+#define JSON_FCNT           "FCnt"
+#define JSON_FREQ           "Freq"
+#define JSON_SF             "SF"
+#define JSON_START          "StartTime"
+#define JSON_END            "EndTime"
+#define JSON_SILENCE        "Silence"
+#define JSON_DEVSEEN        "DevSeen"
+#define JSON_MSGTOTAL       "MsgTotal"
+#define JSON_MSGUNIQ        "MsgUnique"
+#define JSON_MSGFAIL        "MsgFail"
+
+#define JSON_TIME_LEN       25          /* Max length of the timestamp string, including null terminator */
+#define JSON_DEVADDR_LEN    9           /* Max length of the device address string, including null terminator */
+#define JSON_MTYPE_LEN      4           /* Max length of the message type string, including null terminator */
+#define JSON_CRC_LEN        6           /* Max length of the CRC string, including null terminator */
 
 #define GPS_REF_MAX_AGE     30          /* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
 #define XERR_INIT_AVG       16          /* nb of measurements the XTAL correction is averaged on as initial value */
@@ -66,8 +98,21 @@ Maintainer: Sylvain Miermont
 #define DEFAULT_STAT        30          /* default time interval for statistics */
 
 #define SF_COUNT            6           /* Number of spreading factors to be used */ 
-#define RADIO_GROUP_COUNT   2           /* Number of radio groups */
+#define DEFAULT_GROUP_COUNT 2           /* Number of radio groups */
 #define DEFAULT_GROUP       1           /* Default radio group */
+
+#define BITRATE_DR0         250         /* Bitrate(bit/sec) for SF12@125KHz*/
+#define BITRATE_DR1         440         /* Bitrate(bit/sec) for SF11@125KHz*/
+#define BITRATE_DR2         980         /* Bitrate(bit/sec) for SF10@125KHz*/
+#define BITRATE_DR3         1760        /* Bitrate(bit/sec) for SF9@125KHz*/
+#define BITRATE_DR4         3125        /* Bitrate(bit/sec) for SF8@125KHz*/
+#define BITRATE_DR5         5470        /* Bitrate(bit/sec) for SF7@125KHz*/
+
+#define EXTRA_PREAMBLE      8           /* Bytes allocated to LoRa transmission preamble */
+#define EXTRA_SYNCWORD      4.25        /* Bytes allocated to LoRa transmission synchronisation word */
+#define EXTRA_PHDR          8           /* Bytes allocated to LoRa transmission PHDR and PHDR_CRC */
+#define EXTRA_CRC           2           /* Bytes allocated to LoRa transmission CRC */
+
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE TYPES -------------------------------------------------------- */
@@ -81,12 +126,29 @@ typedef struct spectral_scan_s {
     uint32_t        pace_s;         /* number of seconds between 2 scans in the thread */
 } spectral_scan_t;
 
+/* end device report */
+typedef struct ed_report_s {
+    char* timestamp;
+    char* devaddr;
+    char* mtype;
+    char* crc;
+    float freq;
+    uint8_t sf;
+    uint32_t fcnt;
+    float snr;
+    float rssi;
+    float toa;
+    bool adr;
+} ed_report_t;
+
 /* device management */
 typedef struct lora_device_s {
     uint32_t        device_adr;
     uint16_t        fcnt;
     bool            adr_status;
 } lora_device_t;
+
+
 
 /* spreading factor data reading */
 /* backup pointers are used in cases where a realloc is required for more space */
@@ -138,7 +200,7 @@ static double xtal_correct = 1.0;
 /* GPS configuration and synchronization */
 static char gps_tty_path[64] = "\0"; /* path of the TTY port GPS is connected on */
 static int gps_tty_fd = -1; /* file descriptor of the GPS TTY port */
-static bool gps_enabled = false; /* is GPS enabled on that gateway ? */
+static bool gps_enabled = true; /* is GPS enabled on that gateway ? */
 
 /* GPS time reference */
 static pthread_mutex_t mx_timeref = PTHREAD_MUTEX_INITIALIZER; /* control access to GPS time reference */
@@ -159,7 +221,6 @@ static struct coord_s meas_gps_err; /* GPS position of the gateway */
 /* Gateway specificities */
 static int8_t antenna_gain = 0;
 
-
 static struct lgw_conf_debug_s debugconf;
 static uint32_t nb_pkt_received_ref[16];
 
@@ -169,6 +230,7 @@ static lgw_com_type_t com_type = LGW_COM_USB;
 /* Radio configuration structs */
 static bool radio_group_swapping;
 static int radio_group_current; /* Current radio group in use */
+static int radio_group_count;
 static struct lgw_conf_rxrf_s **rfconf; /* Matrix of radio groups [group][radio config] */
 
 /* Spectral Scan */
@@ -179,6 +241,12 @@ static spectral_scan_t spectral_scan_params = {
     .nb_scan = 0,
     .pace_s = 10
 };
+
+/* JSON writing management */
+static char report_string[50];
+static int ed_reports = 0;
+static int ch_reports = 0;
+
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE STATISTIC VARIABLES (GLOBAL) --------------------------------- */
@@ -241,6 +309,64 @@ static void sig_handler(int sigio) {
 }
 
 /**
+ * Create the appropriate string for a JSON file. User can define if the 
+ * file is for a channel or device report, as well as its number. String is placed into
+ * "report_string" variable.
+ * 
+ * @param file_type Either JSON_REPORT_ED or JSON_REPORT_CH
+ * @param index     The number of the file
+*/
+static void create_file_string(char* file_type, int index) {
+
+    char number[20];
+    memset(report_string, 0, 50);
+    sprintf(number, "%d", index);
+    strcat(report_string, file_type);
+    strcat(report_string, number);
+    strcat(report_string, JSON_REPORT_SUFFIX);
+}
+
+/**
+ * Create a JSON report for a given end device information struct.
+ * 
+ * @param info  ed_report_t struct containing all relevant transmission information
+ * @param index Number of the report
+*/
+static void create_ed_report(ed_report_t *info, int index) {
+
+    JSON_Value* root_value;
+    JSON_Object* root_object;
+
+    FILE* file;
+    char* serialized_string = NULL;
+
+    create_file_string(JSON_REPORT_ED, index);
+
+    file = fopen(report_string, "w");
+
+    root_value = json_value_init_object();
+    root_object = json_value_get_object(root_value);
+    json_object_set_string(root_object, JSON_TIME, info->timestamp);
+    json_object_set_string(root_object, JSON_DEVADDR, info->devaddr);
+    json_object_set_string(root_object, JSON_MTYPE, info->mtype);
+    json_object_set_string(root_object, JSON_CRC, info->crc);
+    json_object_set_number(root_object, JSON_FREQ, info->freq);
+    json_object_set_number(root_object, JSON_SF, info->sf);
+    json_object_set_number(root_object, JSON_FCNT, info->fcnt);
+    json_object_set_number(root_object, JSON_SNR, info->snr);
+    json_object_set_number(root_object, JSON_RSSI, info->rssi);
+    json_object_set_number(root_object, JSON_TOA, info->toa);
+    json_object_set_boolean(root_object, JSON_ADR, info->adr);
+    
+    serialized_string = json_serialize_to_string(root_value);
+    fputs(serialized_string, file);
+
+    json_free_serialized_string(serialized_string);
+    json_value_free(root_value);
+    fclose(file);
+}
+
+/**
  * Utility function to find the corresponding channel for a given frequency.
  * 
  * @param freq  Frequency to find channel number of
@@ -297,7 +423,7 @@ static void stat_cleanup(void) {
     int i;
 
     /* cleanup radio configuration */
-    for (i = 0; i < RADIO_GROUP_COUNT; i++)
+    for (i = 0; i < radio_group_count; i++)
         free(rfconf[i]);
 
     free(rfconf);
@@ -535,25 +661,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
         }
     }
 
-
-
-    /* Allocate and initialise memory for the radio information structs and statistics */
-    rfconf = (struct lgw_conf_rxrf_s**)calloc(RADIO_GROUP_COUNT, sizeof(struct lgw_conf_rxrf_s*));
-    for (i = 0; i < RADIO_GROUP_COUNT; i++) {
-        rfconf[i] = (struct lgw_conf_rxrf_s*)calloc(LGW_RF_CHAIN_NB, sizeof(struct lgw_conf_rxrf_s));
-    }
-
-    radio_group_current = DEFAULT_GROUP;
-
-    /* Group swapping configuration */
-    val = json_object_dotget_value(conf_obj, "default_group");
-    if (json_value_get_type(val) == JSONBoolean) {
-        radio_group_swapping = (bool)json_value_get_boolean(val);
-        MSG("INFO: Radio group swapping is %s\n", radio_group_swapping ? "enabled" : "disabled");
-    } else {
-        MSG("INFO: No group swapping configuration, assuming false\n");
-    }
-
+    /* Radio group swapping configuration */
     val = json_object_dotget_value(conf_obj, "group_swapping");
     if (json_value_get_type(val) == JSONBoolean) {
         radio_group_swapping = (bool)json_value_get_boolean(val);
@@ -562,9 +670,34 @@ static int parse_SX130x_configuration(const char * conf_file) {
         MSG("INFO: No group swapping configuration, assuming false\n");
     }
 
+    val = json_object_dotget_value(conf_obj, "default_group");
+    if (json_value_get_type(val) == JSONNumber) {
+        radio_group_current = (int)json_value_get_number(val);
+        MSG("INFO: Custom radio group %d selected\n", radio_group_current);
+    } else {
+        radio_group_current = DEFAULT_GROUP;
+        MSG("INFO: Utilising default radio group %d\n", radio_group_current);
+    }
+
+    val = json_object_dotget_value(conf_obj, "radio_groups");
+    if (json_value_get_type(val) == JSONNumber) {
+        radio_group_count = (int)json_value_get_number(val);
+        MSG("INFO: %d radio groups given\n", radio_group_count);
+    } else {
+        radio_group_count = DEFAULT_GROUP_COUNT;
+        MSG("INFO: Utilising default radio group count %d\n", radio_group_count);
+    }
+
+    
+    /* Allocate and initialise memory for the radio information structs and statistics */
+    rfconf = (struct lgw_conf_rxrf_s**)calloc(radio_group_count, sizeof(struct lgw_conf_rxrf_s*));
+    for (i = 0; i < LGW_RF_CHAIN_NB; i++) {
+        rfconf[i] = (struct lgw_conf_rxrf_s*)calloc(LGW_RF_CHAIN_NB, sizeof(struct lgw_conf_rxrf_s));
+    }
+    
     /* set configuration for RF chains */
     number = 0;
-    for (i = 0; i < RADIO_GROUP_COUNT; i++) {
+    for (i = 0; i < radio_group_count; i++) {
         for (j = 0; j < LGW_RF_CHAIN_NB; j++) {
             snprintf(param_name, sizeof param_name, "radio_%d_%d", i, j); /* compose parameter path inside JSON structure */
             val = json_object_get_value(conf_obj, param_name); /* fetch value (if possible) */
@@ -623,7 +756,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
     }
 
     /* initialise the specific radio group */
-    if (number == LGW_RF_CHAIN_NB * RADIO_GROUP_COUNT) {
+    if (number == LGW_RF_CHAIN_NB * radio_group_count) {
         MSG("ERROR: No valid radio configurations given\n");
         return -1;
     } else {
@@ -881,12 +1014,19 @@ void open_log(void) {
 /* --- THREAD 1: RECEIVING PACKETS ------------------------------------------ */
 void thread_listen(void) {
 
-    int i; /* loop and temporary variables */
+    int i, j; /* loop and temporary variables */
 
     struct timespec sleep_time = {0, 3000000}; /* 3 ms */
 
     /* counting variables */
     unsigned long pkt_in_log = 0;
+
+    /* writing json information */
+    ed_report_t *ed_report = (ed_report_t*)malloc(sizeof(ed_report_t));
+    ed_report->timestamp = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
+    ed_report->devaddr = (char*)malloc(sizeof(char) * JSON_DEVADDR_LEN);
+    ed_report->mtype = (char*)malloc(sizeof(char) * JSON_MTYPE_LEN);
+    ed_report->crc = (char*)malloc(sizeof(char) * JSON_CRC_LEN);
 
     /* allocate memory for packet fetching and processing */
     struct lgw_pkt_rx_s rxpkt[16]; /* array containing up to 16 inbound packets metadata */
@@ -897,15 +1037,27 @@ void thread_listen(void) {
     struct timespec fetch_time;
     struct tm * xt;
 
+    /* gps handling variables */
+    struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
+    struct timespec pkt_utc_time;
+    bool ref_ok = false;
+    
+    /* time printing variables */
+    char timestamp[50];
+    char num_buff[20];
+
     /* recieved packet variables */
     uint8_t  mote_mhdr = 0;
     uint32_t mote_addr = 0;
-    uint8_t  mote_fctrl = 0;
-    uint16_t mote_fcnt = 0;
-    uint8_t  mote_fport = 0;
+    // uint8_t  mote_fctrl = 0;
+    // uint16_t mote_fcnt = 0;
+    // uint8_t  mote_fport = 0;
 
     /* offset variables */
-    uint8_t mote_fopts_len = 0;
+    // uint8_t mote_fopts_len = 0;
+
+    /* airtime calculation variables */
+    float airtime = 0;
 
     printf("\n\n");
     while (!exit_sig && !quit_sig) {
@@ -922,123 +1074,116 @@ void thread_listen(void) {
             clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
         } else {
             /* local timestamp generation until we get accurate GPS time */
-            clock_gettime(CLOCK_REALTIME, &fetch_time);
-            xt = gmtime(&(fetch_time.tv_sec));
-            printf("%04i-%02i-%02i %02i:%02i:%02i.%03liZ\n",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+            // clock_gettime(CLOCK_REALTIME, &fetch_time);
+            // xt = gmtime(&(fetch_time.tv_sec));
+            // printf("%04i-%02i-%02i %02i:%02i:%02i.%03liZ\n",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+        
+            /* get a copy of GPS time reference (avoid 1 mutex per packet) */
+            if ((nb_pkt > 0) && (gps_enabled == true)) {
+                pthread_mutex_lock(&mx_timeref);
+                local_ref = time_reference_gps;
+                ref_ok = gps_ref_valid;
+                pthread_mutex_unlock(&mx_timeref);
+            } else {
+                ref_ok = false;
+            }
         }
 
         /* log packets */
         for (i=0; i < nb_pkt; ++i) {
+            printf("Loop Index: %d, Packet Num: %ld\n", i, ++pkt_in_log);
+
             p = &rxpkt[i];
 
-            /* writing gateway ID */
-            //fprintf(log_file, "\"%08X%08X\",", (uint32_t)(lgwm >> 32), (uint32_t)(lgwm & 0xFFFFFFFF));
+            printf("Beginning mem setting\n");
 
-            /* writing node MAC address */
-            // fputs("\"\",", log_file); // TODO: need to parse payload
+            /* Clear memory for the report data struct */
+            memset(ed_report->timestamp, 0, sizeof(char) * JSON_TIME_LEN);
+            memset(ed_report->devaddr, 0, sizeof(char) * JSON_DEVADDR_LEN);
+            memset(ed_report->mtype, 0, sizeof(char) * JSON_MTYPE_LEN);
+            memset(ed_report->crc, 0, sizeof(char) * JSON_CRC_LEN);
+            memset(timestamp, 0, sizeof(char) * 50);
+            memset(num_buff, 0, sizeof(char) * 20);
 
-            // /* writing UTC timestamp*/
-            printf("Packet %d (%ld)\n", i, ++pkt_in_log);
-
-            /* writing packet status and transmission details*/
-            printf("Status: ");
-            switch(p->status) {
-                case STAT_CRC_OK:       printf("\"CRC_OK\" \n"); break;
-                case STAT_CRC_BAD:      printf("\"CRC_BAD\"\n"); break;
-                case STAT_NO_CRC:       printf("\"NO_CRC\" \n"); break;
-                case STAT_UNDEFINED:    printf("\"UNDEF\"  \n"); break;
-                default:                printf("\"ERR\"    \n");
+            printf("Mem set to 0\n");
+            
+            /* Timestamp setting */
+            if (ref_ok) {
+                j = lgw_cnt2utc(local_ref, p->count_us, &pkt_utc_time);
+                if (j == LGW_GPS_SUCCESS) {
+                    /* split the UNIX timestamp to its calendar components */
+                    xt = gmtime(&(pkt_utc_time.tv_sec));
+                    sprintf(timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+                } else {
+                    printf("Error converting packet timestamp");
+                }
+            } else {
+                /* Print out the internal clock time */
+                clock_gettime(CLOCK_REALTIME, &fetch_time);
+                xt = gmtime(&(fetch_time.tv_sec));
+                sprintf(timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
             }
 
-            printf("Reception Details: ");
-            printf("SNR %.1f, SNR_MIN %.1f, SNR_MAX %.1f, RSSI-C %.1f, RSSI-S %.1f\n", p->snr, p->snr_min, p->snr_max, p->rssic, p->rssis);
+            sprintf(ed_report->timestamp, timestamp);
+            printf("In report: %s\n", ed_report->timestamp);
 
-            printf("Channel Details:   ");
-            printf("Channel %1u, Radio %1u, Frequency %.1lfMHz, Modem Id %2u,", p->if_chain, p->rf_chain, ((double)p->freq_hz / 1e6), p->modem_id);
-
-            printf(" Bandwidth ");
-            switch(p->bandwidth) {
-                case BW_500KHZ:     printf("500kHz,"); break;
-                case BW_250KHZ:     printf("250kHz,"); break;
-                case BW_125KHZ:     printf("125kHz,"); break;
-                case BW_UNDEFINED:  printf("0     ,"); break;
-                default:            printf("-1    ,");
-            }
-
-            printf(" SF ");
-            switch (p->datarate) {
-                case DR_LORA_SF7:   printf("7  "); break;
-                case DR_LORA_SF8:   printf("8  "); break;
-                case DR_LORA_SF9:   printf("9  "); break;
-                case DR_LORA_SF10:  printf("10 "); break;
-                case DR_LORA_SF11:  printf("11 "); break;
-                case DR_LORA_SF12:  printf("12 "); break;
-                default:            printf("ERR");
-            }
-            printf("AU Channel %d", find_channel_no(p->freq_hz));
-            printf("\n");
-
-            /* writing packet data */
-            printf("Packet: \n");
-            printf("Size: %dbytes\n", p->size);
-
-            /* Lets find our heading data */
+            /* MHDR and Message Type */
             mote_mhdr = p->payload[0];
             mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
-            mote_fctrl = p->payload[5];
-            mote_fcnt = p->payload[6] | p->payload[7] << 8;
 
-            mote_fopts_len = mote_fctrl & 0x0F;
+            sprintf(ed_report->devaddr, "%x", mote_addr);
 
-            mote_fport = p->payload[8 + mote_fopts_len];
-
-            printf("MHDR - ");
             switch(mote_mhdr >> 5) {
-                case 0b000 : printf("Join Request");            break;
-                case 0b001 : printf("Join Accept");             break;
-                case 0b010 : printf("Unconfirmed Data Up");     break;
-                case 0b011 : printf("Unconfirmed Data Down");   break;
-                case 0b100 : printf("Confirmed Data Up");       break;
-                case 0b101 : printf("Confirmed Data Down");     break;
-                case 0b110 : printf("RFU");                     break;
-                case 0b111 : printf("Proprietary");             break;
+                case 0b000 : sprintf(ed_report->mtype, "JR");  break;
+                case 0b001 : sprintf(ed_report->mtype, "JA");  break;
+                case 0b010 : sprintf(ed_report->mtype, "UDU"); break;
+                case 0b011 : sprintf(ed_report->mtype, "UDD"); break;
+                case 0b100 : sprintf(ed_report->mtype, "CDU"); break;
+                case 0b101 : sprintf(ed_report->mtype, "CDD"); break;
+                case 0b110 : sprintf(ed_report->mtype, "RFU"); break;
+                case 0b111 : sprintf(ed_report->mtype, "PRP"); break;
             }
-            printf("\n");
-
-            printf("Packet recieve time: %ums\n", p->count_us);
-            printf("Fine timestamp status is %d\n", p->ftime_received);
-            if (p->ftime_received) {
-                printf("Packet fine recieve time: %u\n", p->ftime);
-            } else {
-
-            }
-
-            printf("Device Address %d\n", mote_addr);
-
-            printf("ADR %s\n", (mote_fctrl & 0x80) ? "enabled" : "disabled");
-
-            printf("FCnt %d\n", mote_fcnt);
-
-            printf("FOpts were %d bytes long\n", mote_fopts_len);
-
-            printf("Fport was %d ---> ", mote_fport);
-            if (!mote_fport) {
-                printf("Device message is MAC commands only!\n");
-            } else {
-                printf("Device message contains different commands!\n");
+            
+            /* CRC status */
+            printf("Status: ");
+            switch(p->status) {
+                case STAT_CRC_OK:       sprintf(ed_report->crc, "OK");     break;
+                case STAT_CRC_BAD:      sprintf(ed_report->crc, "BAD");    break;
+                case STAT_NO_CRC:       sprintf(ed_report->crc, "NONE");   break;
+                case STAT_UNDEFINED:    sprintf(ed_report->crc, "UNDEF");  break;
+                default:                sprintf(ed_report->crc, "ERR");
             }
 
-            printf("Payload was ");
-            for (int w = 8 + mote_fopts_len + 1; w < p->size - 4; w++) {
-                printf("%hhx", p->payload[w]);
+            /* General packet statistics - Freq, SF, FCnt, SNR, RSSI, ToA, ADR */
+            ed_report->freq = ((double)p->freq_hz / 1e6);
+            ed_report->sf = p->datarate;
+            ed_report->snr = p->snr;
+            ed_report->fcnt = p->payload[6] | p->payload[7] << 8;
+            ed_report->rssi = -1 * p->rssis;
+
+            airtime = (p->size + EXTRA_PREAMBLE + EXTRA_SYNCWORD + EXTRA_PHDR + EXTRA_CRC) * 8;
+            switch (p->datarate) {
+                case DR_LORA_SF7:   airtime = airtime / BITRATE_DR5; break;
+                case DR_LORA_SF8:   airtime = airtime / BITRATE_DR4; break;
+                case DR_LORA_SF9:   airtime = airtime / BITRATE_DR3; break;
+                case DR_LORA_SF10:  airtime = airtime / BITRATE_DR2; break;
+                case DR_LORA_SF11:  airtime = airtime / BITRATE_DR1; break;
+                case DR_LORA_SF12:  airtime = airtime / BITRATE_DR0; break;
+                default:            printf("ERR");
             }
 
+            ed_report->toa = airtime * 1e3; // In ms 
+            ed_report->adr = (p->payload[5] & 0x80) ? true : false;
+
+            create_ed_report(ed_report, ed_reports++);
 
             if (i == nb_pkt - 1) {
                 printf("\n\n");
             }
         }
     }
+
+    free((void*)ed_report);
     printf("%ld Packets heard!\n", pkt_in_log);
 }
 
@@ -1347,17 +1492,21 @@ void thread_spectral_scan(void) {
                     continue; /* main while loop */
                 }
 
+                
                 /* print results */
-                printf("SPECTRAL SCAN RESULTS - %u Hz: ", freq_hz);
-                for (i = 0; i < LGW_SPECTRAL_SCAN_RESULT_SIZE; i++) {
-                    printf("%u ", results[i]);
-                }
-                printf("\n");
-                printf("SPECTRAL SCAN LEVELS - %u Hz: ", freq_hz);
-                for (i = 0; i < LGW_SPECTRAL_SCAN_RESULT_SIZE; i++) {
-                    printf("%u ", levels[i]);
-                }
-                printf("\n");
+                // printf("SPECTRAL SCAN RESULTS - %u Hz: ", freq_hz);
+                // for (i = 0; i < LGW_SPECTRAL_SCAN_RESULT_SIZE; i++) {
+                //     printf("%u ", results[i]);
+                // }
+                // printf("\n");
+
+
+                //TODO : Uncomment above and delete this print loop
+                // printf("SPECTRAL SCAN LEVELS - %u Hz: ", freq_hz);
+                // for (i = 0; i < LGW_SPECTRAL_SCAN_RESULT_SIZE; i++) {
+                //     printf("LEVEL: %u RESULT: %u\n", levels[i], results[i]);
+                // }
+                // printf("\n");
 
                 /* Next frequency to scan */
                 freq_hz += 200000; /* 200kHz channels */
@@ -1381,56 +1530,6 @@ int main(int argc, char **argv) {
 
     /* return management variable */
     int i, j;
-
-
-
-
-
-
-
-    // int **lmao;
-    // int loopy = 0;
-
-    // int *other;
-
-    // lmao = (int**)calloc(4, sizeof(int*));
-    // for (i = 0; i < 4; i++) {
-    //     lmao[i] = (int*)calloc(4, sizeof(int));
-    //     for (j = 0; j < 4; j++)
-    //         lmao[i][j] = loopy++;
-    // }
-
-    // printf("What do the arrays say?\n");
-
-    // other = (int*)realloc(lmao[1], sizeof(int) * 6);
-
-    // for (i = 0; i < 6; i++) {
-    //     lmao[1][i] = i;
-    // }
-
-    // if (other == NULL)
-    //     printf("Realloc unsuccessful");
-
-    // printf("New pointer is %p\n", other);
-    // printf("Old pointer is %p\n", lmao[1]);
-
-    // for (i = 0; i < 4; i++) {
-    //     printf("Array %d has: ", i);
-    //     if (i == 1) {
-    //         for (j = 0; j < 6; j++) {
-    //             printf("%d ", lmao[i][j]);
-    //         }
-    //     } else {
-    //         for (j = 0; j < 4; j++) {
-    //             printf("%d ", lmao[i][j]);
-    //         }
-    //     }
-        
-    //     printf("\n");
-    // }
-
-    // return EXIT_SUCCESS;
-
 
     /* configuration file related */
     const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
@@ -1552,7 +1651,7 @@ int main(int argc, char **argv) {
             exit(EXIT_FAILURE);
 
             radio_group_current++;
-            radio_group_current %= RADIO_GROUP_COUNT;
+            radio_group_current %= radio_group_count;
 
             init_radio_group(radio_group_current);
 

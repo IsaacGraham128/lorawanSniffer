@@ -36,7 +36,7 @@
 #define ARRAY_MAX_CAPACITY    122880 /* 15*(2^13) */
 #define OBJECT_MAX_CAPACITY      960 /* 15*(2^6)  */
 #define MAX_NESTING               19
-#define DOUBLE_SERIALIZATION_FORMAT "%f"
+#define DOUBLE_SERIALIZATION_FORMAT "%.1lf"
 
 #define SIZEOF_TOKEN(a)       (sizeof(a) - 1)
 #define SKIP_CHAR(str)        ((*str)++)

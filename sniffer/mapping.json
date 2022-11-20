@@ -1,0 +1,62 @@
+{
+    "properties": {
+      "@timestamp": {
+        "type": "date"
+      },
+      "ReportType": {
+        "type": "keyword"
+      },
+      "DevAddr": {
+        "type": "keyword"
+      },
+      "Snr": {
+        "type": "half_float"
+      },
+      "Rssi": {
+        "type": "short"
+      },
+      "Airtime": {
+        "type": "float"
+      },
+      "AdrStatus": {
+        "type": "boolean"
+      },
+      "Confirmed": {
+        "type": "boolean"
+      },
+      "FCnt": {
+        "type": "byte"
+      },
+      "Frequency": {
+        "type": "integer"
+      },
+      "SpreadingFactor": {
+        "type": "byte"
+      },
+      "Silence": {
+        "type": "integer"
+      },
+      "DeviceSeen": {
+        "type": "keyword"
+      },
+      "StartTime": {
+        "type": "date"
+      },
+      "EndTime": {
+        "type": "date"
+      },
+      "DevicesSeen": {
+        "type": "short"
+      },
+      "MessagesSeenTotal": {
+        "type": "short"
+      },
+      "MessagesSeenUnique": {
+        "type": "short"
+      },
+      "MessagesFailed": {
+        "type": "short"
+      }
+    }
+  }
+  
