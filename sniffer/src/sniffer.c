@@ -37,6 +37,7 @@ Maintainer: Sylvain Miermont
 #include <math.h>       /* round */
 
 #include <pthread.h>
+#include <sys/queue.h>  /* STAILQ queue */
 
 #include "parson.h"
 #include "base64.h"
@@ -66,7 +67,9 @@ Maintainer: Sylvain Miermont
 
 #define JSON_REPORT_ED      "device"
 #define JSON_REPORT_CH      "channel"
+#define JSON_REPORT_GW      "gateway"
 
+/* JSON key fields for device and channel report information*/
 #define JSON_TIME           "@timestamp"
 #define JSON_TYPE           "type"
 #define JSON_DEVADDR        "DevAddr"
@@ -81,13 +84,22 @@ Maintainer: Sylvain Miermont
 #define JSON_SF             "SF"
 #define JSON_START          "StartTime"
 #define JSON_END            "EndTime"
-#define JSON_SILENCE        "Silence"
+#define JSON_UTIL           "Util"
 #define JSON_DEVSEEN        "DevSeen"
 #define JSON_MSGTOTAL       "MsgTotal"
 #define JSON_MSGUNIQ        "MsgUnique"
 #define JSON_MSGFAIL        "MsgFail"
 
-#define JSON_TIME_LEN       25          /* Max length of the timestamp string, including null terminator */
+/* JSON key fields for gateway report information */
+#define JSON_TMP_CPU        "temp_cpu"
+#define JSON_TMP_CEL        "temp_cel"
+#define JSON_RAM_UTIL       "ram"    
+// what other fields could I get?
+// rssi for the cell chip?
+// 
+// also need to make a log file
+
+#define JSON_TIME_LEN       80          /* Max length of the timestamp string, including null terminator */
 #define JSON_DEVADDR_LEN    9           /* Max length of the device address string, including null terminator */
 #define JSON_MTYPE_LEN      4           /* Max length of the message type string, including null terminator */
 #define JSON_CRC_LEN        6           /* Max length of the CRC string, including null terminator */
@@ -98,6 +110,7 @@ Maintainer: Sylvain Miermont
 #define DEFAULT_STAT        30          /* default time interval for statistics */
 
 #define SF_COUNT            6           /* Number of spreading factors to be used */ 
+#define SF_BASE             7           /* Lowest SF (7->12) */
 #define DEFAULT_GROUP_COUNT 2           /* Number of radio groups */
 #define DEFAULT_GROUP       1           /* Default radio group */
 
@@ -113,9 +126,16 @@ Maintainer: Sylvain Miermont
 #define EXTRA_PHDR          8           /* Bytes allocated to LoRa transmission PHDR and PHDR_CRC */
 #define EXTRA_CRC           2           /* Bytes allocated to LoRa transmission CRC */
 
-
+#define INFO_ARRAY_DEFAULT  1          /* Initial space allocation for listening to devices */
+#define INFO_ARRAY_SCALER   2          /* Used for realloc increase factor */
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE TYPES -------------------------------------------------------- */
+
+/* basic device memory */
+typedef struct lora_device_s {
+    uint32_t        device_adr;     /* device address */
+    uint32_t        fcnt;           /* device fcount */
+} lora_device_t;
 
 /* spectral scan */
 typedef struct spectral_scan_s {
@@ -141,34 +161,73 @@ typedef struct ed_report_s {
     bool adr;
 } ed_report_t;
 
+/* channel report */
+typedef struct ch_report_s {
+    char* timestamp;
+    char* start;
+    char* end;
+    float freq;
+    uint8_t sf;
+    float utilisation;
+    uint32_t msg_total;
+    uint32_t msg_unique;
+    uint32_t msg_failed; 
+} ch_report_t;
+
+/* channel/sf report info structs */
+typedef struct ch_info_s {
+    float freq;
+    uint8_t sf;
+    struct timespec start_time;
+    float total_airtime;
+    lora_device_t* devices;
+    lora_device_t* devices_tmp;
+    uint32_t list_len;
+    uint32_t device_count;
+    uint32_t msg_total;
+    uint32_t msg_unique;
+    uint32_t msg_failed; 
+} ch_info_t;
+
+typedef struct if_info_s {
+    uint8_t radio;
+    int32_t freq_if;
+} if_info_t;
+
+/* message queue struct type */
+struct entry {
+    struct lgw_pkt_rx_s rx_pkt;
+    STAILQ_ENTRY(entry) entries;
+};
+
+
+
 /* device management */
-typedef struct lora_device_s {
-    uint32_t        device_adr;
-    uint16_t        fcnt;
-    bool            adr_status;
-} lora_device_t;
+// typedef struct lora_device_s {
+//     uint32_t        device_adr;
+//     uint16_t        fcnt;
+//     bool            adr_status;
+// } lora_device_t;
 
-
-
-/* spreading factor data reading */
-/* backup pointers are used in cases where a realloc is required for more space */
-typedef struct freq_data_s {
-    uint32_t        freq_hz;                        /* Frequency of this spreading factor */
-    uint8_t         sf;                             /* Spreading factor entry */
-    uint16_t        devices_seen;                   /* Number of seen devices */
-    uint16_t        devices_len;                    /* Current length of the devices array */
-    uint16_t        messages_seen;                  /* Number of messages seen */
-    uint16_t        messages_len;                   /* Current length of the RSSI and SNR arrays */
-    uint16_t        unique_messages_seen;           /* Number of messages with unique FCnts */
-    uint32_t        message_last_seen;              /* Timestamp of last message recieved */
-    uint32_t        *devices;                       /* List of device addresses seen */
-    float           *RSSI;                          /* List of RSSI values of recieved messages */
-    float           *SNR;                           /* List of SNR values of recieved messages */
-    bool            realloc;                        /* Flag to indicate the backups are in use due to REALLOC */
-    lora_device_t   *b_devices;                     /* Backup list of devices seen */
-    float           *b_RSSI;                        /* Backup list of RSSI values of recieved messages */
-    float           *b_SNR;                         /* Backup list of SNR values of recieved messages */
-} freq_data_t;
+// /* spreading factor data reading */
+// /* backup pointers are used in cases where a realloc is required for more space */
+// typedef struct freq_data_s {
+//     uint32_t        freq_hz;                        /* Frequency of this spreading factor */
+//     uint8_t         sf;                             /* Spreading factor entry */
+//     uint16_t        devices_seen;                   /* Number of seen devices */
+//     uint16_t        devices_len;                    /* Current length of the devices array */
+//     uint16_t        messages_seen;                  /* Number of messages seen */
+//     uint16_t        messages_len;                   /* Current length of the RSSI and SNR arrays */
+//     uint16_t        unique_messages_seen;           /* Number of messages with unique FCnts */
+//     uint32_t        message_last_seen;              /* Timestamp of last message recieved */
+//     uint32_t        *devices;                       /* List of device addresses seen */
+//     float           *RSSI;                          /* List of RSSI values of recieved messages */
+//     float           *SNR;                           /* List of SNR values of recieved messages */
+//     bool            realloc;                        /* Flag to indicate the backups are in use due to REALLOC */
+//     lora_device_t   *b_devices;                     /* Backup list of devices seen */
+//     float           *b_RSSI;                        /* Backup list of RSSI values of recieved messages */
+//     float           *b_SNR;                         /* Backup list of SNR values of recieved messages */
+// } freq_data_t;
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE VARIABLES (GLOBAL) ------------------------------------------- */
@@ -181,6 +240,13 @@ struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
 static int exit_sig = 0; /* 1 -> application terminates cleanly (shut down hardware, close open files, etc) */
 static int quit_sig = 0; /* 1 -> application terminates without shutting down the hardware */
 
+/* STAILQ messaging head and initialisation */
+static pthread_mutex_t mx_report_dev = PTHREAD_MUTEX_INITIALIZER; /* control access to the device message queue */
+static pthread_mutex_t mx_report_ch = PTHREAD_MUTEX_INITIALIZER;  /* control access to the channel aggregate data */
+STAILQ_HEAD(stailhead, entry);
+static struct stailhead head;
+
+
 /* configuration variables needed by the application  */
 static uint64_t lgwm = 0; /* LoRa gateway MAC address */
 static char lgwm_str[17];
@@ -192,6 +258,7 @@ static FILE * log_file = NULL;
 static char log_file_name[64];
 
 /* hardware access control and correction */
+// TODOD : What happens if this is made static??
 pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
 static pthread_mutex_t mx_xcorr = PTHREAD_MUTEX_INITIALIZER; /* control access to the XTAL correction */
 static bool xtal_correct_ok = false; /* set true when XTAL correction is stable enough */
@@ -228,6 +295,7 @@ static uint32_t nb_pkt_received_ref[16];
 static lgw_com_type_t com_type = LGW_COM_USB;
 
 /* Radio configuration structs */
+static if_info_t if_info[LGW_MULTI_NB];
 static bool radio_group_swapping;
 static int radio_group_current; /* Current radio group in use */
 static int radio_group_count;
@@ -243,6 +311,7 @@ static spectral_scan_t spectral_scan_params = {
 };
 
 /* JSON writing management */
+ch_info_t ch_report_info[LGW_MULTI_NB][SF_COUNT];
 static char report_string[50];
 static int ed_reports = 0;
 static int ch_reports = 0;
@@ -251,14 +320,15 @@ static int ch_reports = 0;
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE STATISTIC VARIABLES (GLOBAL) --------------------------------- */
 
-uint16_t devices_seen;
-lora_device_t *devices;
+// Need to delete
+// uint16_t devices_seen;
+// lora_device_t *devices;
 
-bool realloc_flag;
-uint8_t *confirmed_retransmissions;     /* List of retransmission numbers for confirmed messages */
-uint8_t *unconfirmed_retransmissions;   /* List of retransmission numbers for UNconfirmed messages */
-uint8_t *b_confirmed_retransmissions;   /* Realloc list of retransmission numbers for confirmed messages */
-uint8_t *b_unconfirmed_retransmissions; /* Realloc list of retransmission numbers for UNconfirmed messages */
+// bool realloc_flag;
+// uint8_t *confirmed_retransmissions;     /* List of retransmission numbers for confirmed messages */
+// uint8_t *unconfirmed_retransmissions;   /* List of retransmission numbers for UNconfirmed messages */
+// uint8_t *b_confirmed_retransmissions;   /* Realloc list of retransmission numbers for confirmed messages */
+// uint8_t *b_unconfirmed_retransmissions; /* Realloc list of retransmission numbers for UNconfirmed messages */
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DECLARATION ---------------------------------------- */
@@ -266,7 +336,37 @@ static void usage (void);
 
 static void sig_handler(int sigio);
 
+static void create_file_string(char* file_type, int index);
+
+static ed_report_t* create_ed_report(void);
+
+static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct tm *xt, struct timespec *fetch_time);
+
+static void reset_ed_report(ed_report_t* report);
+
+static void destroy_ed_report(ed_report_t* report);
+
+static void encode_ed_report(ed_report_t *info, int index);
+
+static void encode_ch_report(ch_report_t *info, int index);
+
+static void create_gw_report (void);
+
+static void create_all_channel_reports(void);
+
+static void ch_report_structs_init (void);
+
+static void ch_report_structs_cleanup (void);
+
 static uint8_t find_channel_no(uint32_t freq);
+
+static int start_sniffer(void);
+
+static int stop_sniffer(void);
+
+static void stat_cleanup(void);
+
+static int init_radio_group (int group);
 
 static int parse_SX130x_configuration(const char * conf_file);
 
@@ -282,6 +382,8 @@ static void gps_process_coords(void);
 void thread_listen(void);
 void thread_gps(void);
 void thread_valid(void);
+void thread_spectral_scan(void);
+void thread_encode(void);
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS  ----------------------------------------- */
@@ -327,16 +429,127 @@ static void create_file_string(char* file_type, int index) {
 }
 
 /**
+ * Create (allocate memory) for an ED report object.
+ * 
+ * @return  Pointer to an ed_report_t object
+*/
+static ed_report_t* create_ed_report(void) {
+
+    ed_report_t *ed_report =    (ed_report_t*)calloc(1, sizeof(ed_report_t));
+    ed_report->timestamp =      (char*)calloc(JSON_TIME_LEN, sizeof(char));
+    ed_report->devaddr =        (char*)calloc(JSON_DEVADDR_LEN, sizeof(char));
+    ed_report->mtype =          (char*)calloc(JSON_MTYPE_LEN, sizeof(char));
+    ed_report->crc =            (char*)calloc(JSON_CRC_LEN, sizeof(char));
+
+    return ed_report;
+}
+
+/**
+ * Fill an ed_report_t object with the appropriate data given the lgw_pkt_rx_s and timestamp.
+ * 
+ * @param report    Pointer to the ed_report_t object to fill
+ * @param p         Pointer to the lgw_pkt_rx_s containing the incoming transmission data
+ * @param timestamp Pointer to a tm struct timestamp object
+ * 
+ * @return          None
+*/
+static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct tm *xt, struct timespec *fetch_time) {
+
+    /* airtime calculation variable */
+    float airtime = 0;
+
+    /* recieved packet variables */
+    uint32_t mote_addr = 0;
+    uint8_t  mote_mhdr = 0;
+
+    /* Timestamp */
+    sprintf(report->timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time->tv_nsec)/1000000); /* ISO 8601 format */
+    /* MHDR and Message Type */
+    mote_mhdr = p->payload[0];
+    mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
+
+    sprintf(report->devaddr, "%x", mote_addr);
+
+    switch(mote_mhdr >> 5) {
+        case 0b000 : sprintf(report->mtype, "JR");  break;
+        case 0b001 : sprintf(report->mtype, "JA");  break;
+        case 0b010 : sprintf(report->mtype, "UDU"); break;
+        case 0b011 : sprintf(report->mtype, "UDD"); break;
+        case 0b100 : sprintf(report->mtype, "CDU"); break;
+        case 0b101 : sprintf(report->mtype, "CDD"); break;
+        case 0b110 : sprintf(report->mtype, "RFU"); break;
+        case 0b111 : sprintf(report->mtype, "PRP"); break;
+    }
+
+    /* CRC status */
+    switch(p->status) {
+        case STAT_CRC_OK:       sprintf(report->crc, "OK");     break;
+        case STAT_CRC_BAD:      sprintf(report->crc, "BAD");    break;
+        case STAT_NO_CRC:       sprintf(report->crc, "NONE");   break;
+        case STAT_UNDEFINED:    sprintf(report->crc, "UNDEF");  break;
+        default:                sprintf(report->crc, "ERR");
+    }
+
+    /* General packet statistics - Freq, SF, FCnt, SNR, RSSI, ToA, ADR */
+    report->freq = ((double)p->freq_hz / 1e6);
+    report->sf = p->datarate;
+    report->snr = p->snr;
+    report->fcnt = p->payload[6] | p->payload[7] << 8;
+    report->rssi = -1 * p->rssis;
+
+    airtime = (p->size + EXTRA_PREAMBLE + EXTRA_SYNCWORD + EXTRA_PHDR + EXTRA_CRC) * 8;
+    switch (p->datarate) {
+        case DR_LORA_SF7:   airtime = airtime / BITRATE_DR5; break;
+        case DR_LORA_SF8:   airtime = airtime / BITRATE_DR4; break;
+        case DR_LORA_SF9:   airtime = airtime / BITRATE_DR3; break;
+        case DR_LORA_SF10:  airtime = airtime / BITRATE_DR2; break;
+        case DR_LORA_SF11:  airtime = airtime / BITRATE_DR1; break;
+        case DR_LORA_SF12:  airtime = airtime / BITRATE_DR0; break;
+        default:            printf("ERR");
+    }
+
+    report->toa = airtime * 1e3; // In ms 
+    report->adr = (p->payload[5] & 0x80) ? true : false;
+}
+
+/**
+ * Set memory of pointers within ed_report_t object to 0.
+ * 
+ * @param report    Pointer to the ed_report_t object to clear
+*/
+static void reset_ed_report(ed_report_t* report) {
+
+    /* Set all allocated memory sections to zero */
+    memset(report->timestamp, 0, sizeof(char) * JSON_TIME_LEN);
+    memset(report->devaddr, 0, sizeof(char) * JSON_DEVADDR_LEN);
+    memset(report->mtype, 0, sizeof(char) * JSON_MTYPE_LEN);
+    memset(report->crc, 0, sizeof(char) * JSON_CRC_LEN);
+}
+
+/**
+ * Destroy the allocated memory associated with a ed_report_t object
+ * 
+ * @param report    Pointer to the ed_report_t object to free 
+*/
+static void destroy_ed_report(ed_report_t* report) {
+
+    free((void*)report->timestamp);
+    free((void*)report->devaddr);
+    free((void*)report->mtype);
+    free((void*)report->crc);
+    free((void*)report);
+}
+
+/**
  * Create a JSON report for a given end device information struct.
  * 
- * @param info  ed_report_t struct containing all relevant transmission information
+ * @param info  ed_report_t containing all relevant transmission information
  * @param index Number of the report
 */
-static void create_ed_report(ed_report_t *info, int index) {
+static void encode_ed_report(ed_report_t *info, int index) {
 
     JSON_Value* root_value;
     JSON_Object* root_object;
-
     FILE* file;
     char* serialized_string = NULL;
 
@@ -346,17 +559,100 @@ static void create_ed_report(ed_report_t *info, int index) {
 
     root_value = json_value_init_object();
     root_object = json_value_get_object(root_value);
-    json_object_set_string(root_object, JSON_TIME, info->timestamp);
-    json_object_set_string(root_object, JSON_DEVADDR, info->devaddr);
-    json_object_set_string(root_object, JSON_MTYPE, info->mtype);
-    json_object_set_string(root_object, JSON_CRC, info->crc);
-    json_object_set_number(root_object, JSON_FREQ, info->freq);
-    json_object_set_number(root_object, JSON_SF, info->sf);
-    json_object_set_number(root_object, JSON_FCNT, info->fcnt);
-    json_object_set_number(root_object, JSON_SNR, info->snr);
-    json_object_set_number(root_object, JSON_RSSI, info->rssi);
-    json_object_set_number(root_object, JSON_TOA, info->toa);
-    json_object_set_boolean(root_object, JSON_ADR, info->adr);
+    json_object_set_string(root_object, JSON_TIME,      info->timestamp);
+    json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_ED);
+    json_object_set_string(root_object, JSON_DEVADDR,   info->devaddr);
+    json_object_set_string(root_object, JSON_MTYPE,     info->mtype);
+    json_object_set_string(root_object, JSON_CRC,       info->crc);
+    json_object_set_number(root_object, JSON_FREQ,      info->freq);
+    json_object_set_number(root_object, JSON_SF,        info->sf);
+    json_object_set_number(root_object, JSON_FCNT,      info->fcnt);
+    json_object_set_number(root_object, JSON_SNR,       info->snr);
+    json_object_set_number(root_object, JSON_RSSI,      info->rssi);
+    json_object_set_number(root_object, JSON_TOA,       info->toa);
+    json_object_set_boolean(root_object, JSON_ADR,      info->adr);
+    
+    serialized_string = json_serialize_to_string(root_value);
+    //serialized_string = json_serialize_to_string_pretty(root_value);
+    fputs(serialized_string, file);
+
+    json_free_serialized_string(serialized_string);
+    json_value_free(root_value);
+    fclose(file);
+}
+
+/**
+ * Create a JSON report for a given channel and spreading factor information struct.
+ * 
+ * @param info  ch_report_t containing all relevant channel activity information
+ * @param index Number of the report
+*/
+static void encode_ch_report(ch_report_t *info, int index) {
+
+    JSON_Value* root_value;
+    JSON_Object* root_object;
+    FILE* file;
+    char* serialized_string = NULL;
+
+    create_file_string(JSON_REPORT_CH, index);
+
+    file = fopen(report_string, "w");
+
+    root_value = json_value_init_object();
+    root_object = json_value_get_object(root_value);
+    json_object_set_string(root_object, JSON_TIME,      info->timestamp);
+    json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_CH);
+    json_object_set_string(root_object, JSON_START,     info->start);
+    json_object_set_string(root_object, JSON_END,       info->end);
+    json_object_set_number(root_object, JSON_FREQ,      info->freq);
+    json_object_set_number(root_object, JSON_SF,        info->sf);
+    json_object_set_number(root_object, JSON_UTIL,      info->utilisation);
+    json_object_set_number(root_object, JSON_MSGTOTAL,  info->msg_total);
+    json_object_set_number(root_object, JSON_MSGUNIQ,   info->msg_unique);
+    json_object_set_number(root_object, JSON_MSGFAIL,   info->msg_failed);
+
+    serialized_string = json_serialize_to_string(root_value);
+    //serialized_string = json_serialize_to_string_pretty(root_value);
+    fputs(serialized_string, file);
+
+    json_free_serialized_string(serialized_string);
+    json_value_free(root_value);
+    fclose(file);
+}
+
+/**
+ * Create a JSON report for the current gateway statistics.
+*/
+static void create_gw_report (void) {
+
+    JSON_Value* root_value;
+    JSON_Object* root_object;
+    FILE* file;
+    char* serialized_string = NULL;
+    char* timestamp = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
+
+    /* Variables for utilisation and statistics  */
+    float temp_cpu;
+    float temp_cel;
+    float ram;
+    struct timespec fetch_time;
+    struct tm *xt;
+
+    clock_gettime(CLOCK_REALTIME, &fetch_time);
+    xt = gmtime(&(fetch_time.tv_sec));
+    sprintf(timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+
+    create_file_string(JSON_REPORT_GW, 0);
+
+    file = fopen(report_string, "w");
+
+    root_value = json_value_init_object();
+    root_object = json_value_get_object(root_value);
+    json_object_set_string(root_object, JSON_TIME,      timestamp);
+    json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_GW);
+    json_object_set_number(root_object, JSON_TMP_CPU,   temp_cpu);
+    json_object_set_number(root_object, JSON_TMP_CEL,   temp_cel);
+    json_object_set_number(root_object, JSON_RAM_UTIL,  ram);
     
     serialized_string = json_serialize_to_string(root_value);
     fputs(serialized_string, file);
@@ -364,6 +660,119 @@ static void create_ed_report(ed_report_t *info, int index) {
     json_free_serialized_string(serialized_string);
     json_value_free(root_value);
     fclose(file);
+
+    free((void*)timestamp);
+}
+
+/**
+ * Create all channel report json files based of the ch_report_info matrix.
+*/
+static void create_all_channel_reports(void) {
+
+    struct timespec fetch_time;
+    struct tm *xt;
+    ch_info_t *ch_info;
+    ch_report_t *ch_report;
+    char *start_time;
+    char *end_time;
+    float utilisation;
+    
+    start_time = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
+    end_time = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
+    
+    ch_report = (ch_report_t*)calloc(1, sizeof(ch_report_t));
+
+    clock_gettime(CLOCK_REALTIME, &fetch_time);
+    xt = gmtime(&(fetch_time.tv_sec));
+    sprintf(end_time, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+
+    for (int i = 0; i < LGW_MULTI_NB; i++) {
+        for (int j = 0; j < SF_COUNT; j++) {
+            if (ch_report_info[i][j].device_count) {
+                ch_info = &ch_report_info[i][j];
+
+                xt = gmtime(&(ch_info->start_time.tv_sec));
+                sprintf(start_time, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+
+                ch_report->timestamp = end_time;
+                ch_report->start = start_time;
+                ch_report->end = end_time;
+
+                ch_report->freq = ch_info->freq;
+                ch_report->sf = ch_info->sf;
+
+                ch_report->msg_total = ch_info->msg_total;
+                ch_report->msg_unique = ch_info->msg_unique;
+                ch_report->msg_failed = ch_info->msg_failed;
+
+                utilisation = ch_info->total_airtime / (float)(fetch_time.tv_sec - ch_info->start_time.tv_sec);
+
+                printf("The channel activity airtime was %f\n", ch_info->total_airtime);
+                printf("The channel duration was %f\n", (float)(fetch_time.tv_sec - ch_info->start_time.tv_sec));
+                printf("Hence the util was %f percent\n", utilisation * 1e2);
+
+                ch_report->utilisation = utilisation * 1e2; // Move up to percentile
+
+                encode_ch_report(ch_report, ch_reports++);
+            }
+        }
+    }
+
+    free((void*)start_time);
+    free((void*)end_time);
+    free((void*)ch_report);
+}
+
+/**
+ * Create all of the necessary channel report information structs used to store
+ * information necessary to generating the channel report info
+*/
+static void ch_report_structs_init (void) {
+
+    ch_info_t *ch_info;
+    uint32_t radio_0_freq, radio_1_freq;
+    struct tm *xt;
+    struct timespec fetch_time;
+
+    clock_gettime(CLOCK_REALTIME, &fetch_time);
+    xt = gmtime(&(fetch_time.tv_sec));
+    printf("Call in main pre loop (again) %04i-%02i-%02i %02i:%02i:%02i.%03liZ\n",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
+    
+    radio_0_freq = rfconf[radio_group_current][0].freq_hz;
+    radio_1_freq = rfconf[radio_group_current][1].freq_hz;
+
+    for (int i = 0; i < LGW_MULTI_NB; i++) {
+        for (int j = 0; j < SF_COUNT; j++) {
+            // Get ch report info struct and assign to pointer for nicer looking code
+            ch_info = &ch_report_info[i][j];
+            
+            // Clear the memory and set the variables
+            memset((void*)ch_info, 0, sizeof(ch_info_t));
+            ch_info->start_time = fetch_time;
+            ch_info->devices = (lora_device_t*)calloc(INFO_ARRAY_DEFAULT, sizeof(lora_device_t));
+            ch_info->list_len = INFO_ARRAY_DEFAULT;
+            ch_info->freq = if_info[i].radio ? radio_1_freq : radio_0_freq;
+            ch_info->freq = (ch_info->freq + if_info[i].freq_if) / 1e6;
+            ch_info->sf = (SF_BASE + j) ;
+            ch_info->total_airtime = 0;
+            ch_info->device_count = 0;
+            ch_info->msg_total = 0;
+            ch_info->msg_unique = 0;
+            ch_info->msg_failed = 0;
+        }
+    }
+}
+
+/**
+ * Cleanup allocated memory given to each ch_info piece
+*/
+static void ch_report_structs_cleanup (void) {
+
+    for (int i = 0; i < LGW_MULTI_NB; i++) {
+        for (int j = 0; j < SF_COUNT; j++) {
+            free((void*)ch_report_info[i][j].devices);
+        }
+    }
 }
 
 /**
@@ -453,7 +862,7 @@ static int init_radio_group (int group) {
 
 static int parse_SX130x_configuration(const char * conf_file) {
     int i, j, number;
-    char param_name[32]; /* used to generate variable parameter names */
+    char param_name[40]; /* used to generate variable parameter names */
     const char *str; /* used to store string value from JSON object */
     const char conf_obj_name[] = "SX130x_conf";
     JSON_Value *root_val = NULL;
@@ -714,7 +1123,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
             } else {
                 rfconf[i][j].enable = false;
             }
-            if (rfconf[i][j].enable == false) { /* radio disabled, nothing else to parse */
+            if (rfconf[i][j].enable == false) { /* radio disabsled, nothing else to parse */
                 MSG("INFO: Group %d radio %i disabled\n", i, j);
             } else  { /* radio enabled, will parse the other parameters */
                 snprintf(param_name, sizeof param_name, "radio_%d_%d.freq", i, j);
@@ -822,6 +1231,8 @@ static int parse_SX130x_configuration(const char * conf_file) {
             ifconf.rf_chain = (uint32_t)json_object_dotget_number(conf_obj, param_name);
             snprintf(param_name, sizeof param_name, "chan_multiSF_%i.if", i);
             ifconf.freq_hz = (int32_t)json_object_dotget_number(conf_obj, param_name);
+            if_info[i].radio = ifconf.rf_chain;
+            if_info[i].freq_if = ifconf.freq_hz;
             // TODO: handle individual SF enabling and disabling (spread_factor)
             MSG("INFO: Lora multi-SF channel %i>  radio %i, IF %i Hz, 125 kHz bw, SF 5 to 12\n", i, ifconf.rf_chain, ifconf.freq_hz);
         }
@@ -1014,50 +1425,20 @@ void open_log(void) {
 /* --- THREAD 1: RECEIVING PACKETS ------------------------------------------ */
 void thread_listen(void) {
 
-    int i, j; /* loop and temporary variables */
+    int i; /* loop and temporary variables */
 
     struct timespec sleep_time = {0, 3000000}; /* 3 ms */
+    // struct timespec sleep_time = {0, 5000000000}; /* 5000 ms */
 
     /* counting variables */
     unsigned long pkt_in_log = 0;
 
-    /* writing json information */
-    ed_report_t *ed_report = (ed_report_t*)malloc(sizeof(ed_report_t));
-    ed_report->timestamp = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
-    ed_report->devaddr = (char*)malloc(sizeof(char) * JSON_DEVADDR_LEN);
-    ed_report->mtype = (char*)malloc(sizeof(char) * JSON_MTYPE_LEN);
-    ed_report->crc = (char*)malloc(sizeof(char) * JSON_CRC_LEN);
-
     /* allocate memory for packet fetching and processing */
     struct lgw_pkt_rx_s rxpkt[16]; /* array containing up to 16 inbound packets metadata */
-    struct lgw_pkt_rx_s *p; /* pointer on a RX packet */
     int nb_pkt;
 
-    /* local timestamp variables until we get accurate GPS time */
-    struct timespec fetch_time;
-    struct tm * xt;
-
-    /* gps handling variables */
-    struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
-    struct timespec pkt_utc_time;
-    bool ref_ok = false;
-    
-    /* time printing variables */
-    char timestamp[50];
-    char num_buff[20];
-
-    /* recieved packet variables */
-    uint8_t  mote_mhdr = 0;
-    uint32_t mote_addr = 0;
-    // uint8_t  mote_fctrl = 0;
-    // uint16_t mote_fcnt = 0;
-    // uint8_t  mote_fport = 0;
-
-    /* offset variables */
-    // uint8_t mote_fopts_len = 0;
-
-    /* airtime calculation variables */
-    float airtime = 0;
+    /* struct for placing data into encoding queue */
+    struct entry *pkt_encode;
 
     printf("\n\n");
     while (!exit_sig && !quit_sig) {
@@ -1072,119 +1453,114 @@ void thread_listen(void) {
             exit(EXIT_FAILURE);
         } else if (nb_pkt == 0) {
             clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
+            continue; // restart loop and check again
         } else {
-            /* local timestamp generation until we get accurate GPS time */
-            // clock_gettime(CLOCK_REALTIME, &fetch_time);
-            // xt = gmtime(&(fetch_time.tv_sec));
-            // printf("%04i-%02i-%02i %02i:%02i:%02i.%03liZ\n",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
-        
-            /* get a copy of GPS time reference (avoid 1 mutex per packet) */
-            if ((nb_pkt > 0) && (gps_enabled == true)) {
-                pthread_mutex_lock(&mx_timeref);
-                local_ref = time_reference_gps;
-                ref_ok = gps_ref_valid;
-                pthread_mutex_unlock(&mx_timeref);
-            } else {
-                ref_ok = false;
+            pthread_mutex_lock(&mx_report_dev);
+            for (i = 0; i < nb_pkt; ++i) {
+                pkt_encode = (struct entry*)malloc(sizeof(struct entry));
+                pkt_encode->rx_pkt = rxpkt[i];
+                STAILQ_INSERT_TAIL(&head, pkt_encode, entries);
             }
-        }
-
-        /* log packets */
-        for (i=0; i < nb_pkt; ++i) {
-            printf("Loop Index: %d, Packet Num: %ld\n", i, ++pkt_in_log);
-
-            p = &rxpkt[i];
-
-            printf("Beginning mem setting\n");
-
-            /* Clear memory for the report data struct */
-            memset(ed_report->timestamp, 0, sizeof(char) * JSON_TIME_LEN);
-            memset(ed_report->devaddr, 0, sizeof(char) * JSON_DEVADDR_LEN);
-            memset(ed_report->mtype, 0, sizeof(char) * JSON_MTYPE_LEN);
-            memset(ed_report->crc, 0, sizeof(char) * JSON_CRC_LEN);
-            memset(timestamp, 0, sizeof(char) * 50);
-            memset(num_buff, 0, sizeof(char) * 20);
-
-            printf("Mem set to 0\n");
-            
-            /* Timestamp setting */
-            if (ref_ok) {
-                j = lgw_cnt2utc(local_ref, p->count_us, &pkt_utc_time);
-                if (j == LGW_GPS_SUCCESS) {
-                    /* split the UNIX timestamp to its calendar components */
-                    xt = gmtime(&(pkt_utc_time.tv_sec));
-                    sprintf(timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
-                } else {
-                    printf("Error converting packet timestamp");
-                }
-            } else {
-                /* Print out the internal clock time */
-                clock_gettime(CLOCK_REALTIME, &fetch_time);
-                xt = gmtime(&(fetch_time.tv_sec));
-                sprintf(timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
-            }
-
-            sprintf(ed_report->timestamp, timestamp);
-            printf("In report: %s\n", ed_report->timestamp);
-
-            /* MHDR and Message Type */
-            mote_mhdr = p->payload[0];
-            mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
-
-            sprintf(ed_report->devaddr, "%x", mote_addr);
-
-            switch(mote_mhdr >> 5) {
-                case 0b000 : sprintf(ed_report->mtype, "JR");  break;
-                case 0b001 : sprintf(ed_report->mtype, "JA");  break;
-                case 0b010 : sprintf(ed_report->mtype, "UDU"); break;
-                case 0b011 : sprintf(ed_report->mtype, "UDD"); break;
-                case 0b100 : sprintf(ed_report->mtype, "CDU"); break;
-                case 0b101 : sprintf(ed_report->mtype, "CDD"); break;
-                case 0b110 : sprintf(ed_report->mtype, "RFU"); break;
-                case 0b111 : sprintf(ed_report->mtype, "PRP"); break;
-            }
-            
-            /* CRC status */
-            printf("Status: ");
-            switch(p->status) {
-                case STAT_CRC_OK:       sprintf(ed_report->crc, "OK");     break;
-                case STAT_CRC_BAD:      sprintf(ed_report->crc, "BAD");    break;
-                case STAT_NO_CRC:       sprintf(ed_report->crc, "NONE");   break;
-                case STAT_UNDEFINED:    sprintf(ed_report->crc, "UNDEF");  break;
-                default:                sprintf(ed_report->crc, "ERR");
-            }
-
-            /* General packet statistics - Freq, SF, FCnt, SNR, RSSI, ToA, ADR */
-            ed_report->freq = ((double)p->freq_hz / 1e6);
-            ed_report->sf = p->datarate;
-            ed_report->snr = p->snr;
-            ed_report->fcnt = p->payload[6] | p->payload[7] << 8;
-            ed_report->rssi = -1 * p->rssis;
-
-            airtime = (p->size + EXTRA_PREAMBLE + EXTRA_SYNCWORD + EXTRA_PHDR + EXTRA_CRC) * 8;
-            switch (p->datarate) {
-                case DR_LORA_SF7:   airtime = airtime / BITRATE_DR5; break;
-                case DR_LORA_SF8:   airtime = airtime / BITRATE_DR4; break;
-                case DR_LORA_SF9:   airtime = airtime / BITRATE_DR3; break;
-                case DR_LORA_SF10:  airtime = airtime / BITRATE_DR2; break;
-                case DR_LORA_SF11:  airtime = airtime / BITRATE_DR1; break;
-                case DR_LORA_SF12:  airtime = airtime / BITRATE_DR0; break;
-                default:            printf("ERR");
-            }
-
-            ed_report->toa = airtime * 1e3; // In ms 
-            ed_report->adr = (p->payload[5] & 0x80) ? true : false;
-
-            create_ed_report(ed_report, ed_reports++);
-
-            if (i == nb_pkt - 1) {
-                printf("\n\n");
-            }
+            pthread_mutex_unlock(&mx_report_dev);
         }
     }
 
-    free((void*)ed_report);
     printf("%ld Packets heard!\n", pkt_in_log);
+    MSG("\nINFO: End of listening thread\n");
+}
+
+/* -------------------------------------------------------------------------- */
+/* --- THREAD 1.1: JSON encoding for device packet info --------------------- */
+void thread_encode(void) {
+
+    /* General return variable holder */
+    int i = 0;
+
+    /* sleep managent value */
+    struct timespec sleep_time = {0, 3000000}; /* 0 s, 3ms */
+
+    /* Structs for traversing STAILQ*/
+    struct entry *pkt_encode, *pkt_next;
+
+    /* object for data encoding */
+    ed_report_t *report = create_ed_report();
+
+    /* gps handling variables */
+    struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
+    bool gps_ok = false;
+
+    /* timestamp variables until GPS is acquired */
+    struct timespec pkt_utc_time;
+    struct tm *xt;
+
+    while (!exit_sig && !quit_sig) {
+
+        pthread_mutex_lock(&mx_report_dev);
+        pthread_mutex_lock(&mx_report_ch);
+
+        if ((STAILQ_EMPTY(&head) == false) && (gps_enabled == true)) {
+            pthread_mutex_lock(&mx_timeref);
+            local_ref = time_reference_gps;
+            gps_ok = gps_ref_valid;
+            pthread_mutex_unlock(&mx_timeref);
+        } else {
+            gps_ok = false;
+        }
+
+        pkt_encode = STAILQ_FIRST(&head);
+
+        while (pkt_encode != NULL) {
+
+            /* Clear data in report object*/
+            reset_ed_report(report);
+
+            /* Acquire timestamp data */
+            if (gps_ok) {
+                i = lgw_cnt2utc(local_ref, pkt_encode->rx_pkt.count_us, &pkt_utc_time);
+                if (i != LGW_GPS_SUCCESS) {
+                    clock_gettime(CLOCK_REALTIME, &pkt_utc_time);
+                }
+            } else {
+                clock_gettime(CLOCK_REALTIME, &pkt_utc_time);
+            }
+            xt = gmtime(&(pkt_utc_time.tv_sec));
+
+            /* Write to report and encode t device json */
+            write_ed_report(report, &pkt_encode->rx_pkt, xt, &pkt_utc_time);
+            encode_ed_report(report, ed_reports++);
+
+            /* traverse STAILQ and cleanup old queue entry */
+            pkt_next = STAILQ_NEXT(pkt_encode, entries);
+            STAILQ_REMOVE(&head, pkt_encode, entry, entries);
+            free((void*)pkt_encode);
+            pkt_encode = pkt_next;
+        }
+        pthread_mutex_unlock(&mx_report_ch);
+        pthread_mutex_unlock(&mx_report_dev);
+
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
+    }
+
+    destroy_ed_report(report);
+    MSG("\nINFO: End of encoding thread\n");
+}
+
+/* -------------------------------------------------------------------------- */
+/* --- THREAD 1.11: Channel aggregate encoding and uploading JSONs ---------- */
+void thread_upload(void) {
+
+    // while (!exit_sig && !quit_sig) {
+
+    //     struct entry pkt_encode;
+
+    //     pthread_mutex_lock(&mx_report_dev);
+    //     if (STAILQ_EMPTY(&head) == 0) {
+            
+
+    //     }
+    //     pthread_mutex_unlock(&mx_report_dev);
+    // }
+
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1197,7 +1573,7 @@ static void gps_process_sync(void) {
 
     /* get GPS time for synchronization */
     if (i != LGW_GPS_SUCCESS) {
-        MSG("WARNING: [gps] could not get GPS time from GPS\n");
+        //MSG("WARNING: [gps] could not get GPS time from GPS\n");
         return;
     }
 
@@ -1537,9 +1913,13 @@ int main(int argc, char **argv) {
 
     /* threads */
     pthread_t thrid_listen;
+    pthread_t thrid_encode;
     pthread_t thrid_gps;
     pthread_t thrid_valid;
     pthread_t thrid_spectral;
+
+    /* message queue initialisation */
+    STAILQ_INIT(&head);
 
     /* parse command line options */
     while( (i = getopt( argc, argv, "hc:" )) != -1 )
@@ -1601,7 +1981,20 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
 
     /* opening log file and writing CSV header*/
-    time(&now_time);
+    //time(&now_time);
+
+
+
+    ch_report_structs_init();
+
+    // ch_report_structs_cleanup();
+
+    /* end device encoding thread */
+    i = pthread_create(&thrid_encode, NULL, (void * (*)(void *))thread_encode, NULL);
+    if (i != 0) {
+        MSG("ERROR: [main] impossible to create encoding thread\n");
+        exit(EXIT_FAILURE);
+    }
 
     /* main listener for upstream */
     i = pthread_create(&thrid_listen, NULL, (void * (*)(void *))thread_listen, NULL);
@@ -1646,9 +2039,17 @@ int main(int argc, char **argv) {
         wait_ms(1000 * stat_interval);
         pthread_mutex_lock(&mx_concent);
 
+        // TODO Rearrange the order, make the sniffer stop -> report -> swap radios if needed -> restart sniffer
+
         if (radio_group_swapping) {
             if (stop_sniffer())
-            exit(EXIT_FAILURE);
+                exit(EXIT_FAILURE);
+
+            // Create all the channel reports
+
+            // Create any gateway reports
+
+            // Upload all of the channel, gateway, and device reports
 
             radio_group_current++;
             radio_group_current %= radio_group_count;
@@ -1691,6 +2092,34 @@ int main(int argc, char **argv) {
         stop_sniffer();
         stat_cleanup();
     }
+
+    create_all_channel_reports();
+
+    printf("\n\n");
+    ch_info_t *ch_info;
+
+    for (i = 0; i < LGW_MULTI_NB; i++) {
+        for (j = 0; j < SF_COUNT; j++) {
+            if (ch_report_info[i][j].device_count) {
+                ch_info = &ch_report_info[i][j];
+                printf("Activity found on channel %.1fHz @ SF: %d\n", ch_info->freq, ch_info->sf);
+
+                printf("Recieved messages from the following devices:\n");
+
+                for(uint32_t g = 0; g < ch_info->device_count; g++) {
+                    printf("%x, ", ch_info->devices[g].device_adr);
+                }
+                printf("\n");
+                printf("Message total: %d (unique: %d, failed: %d)\n", ch_info->msg_total, ch_info->msg_unique, ch_info->msg_failed);
+                printf("\n");
+            }
+        }
+    }
+    printf("\n\n");
+
+    /* message queue deinitialisation */
+    STAILQ_INIT(&head);
+
     MSG("INFO: Exiting packet sniffer program\n");
     return EXIT_SUCCESS;
 }

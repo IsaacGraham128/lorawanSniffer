@@ -1,62 +1,73 @@
 {
-    "properties": {
-      "@timestamp": {
-        "type": "date"
-      },
-      "ReportType": {
-        "type": "keyword"
-      },
-      "DevAddr": {
-        "type": "keyword"
-      },
-      "Snr": {
-        "type": "half_float"
-      },
-      "Rssi": {
-        "type": "short"
-      },
-      "Airtime": {
-        "type": "float"
-      },
-      "AdrStatus": {
-        "type": "boolean"
-      },
-      "Confirmed": {
-        "type": "boolean"
-      },
-      "FCnt": {
-        "type": "byte"
-      },
-      "Frequency": {
-        "type": "integer"
-      },
-      "SpreadingFactor": {
-        "type": "byte"
-      },
-      "Silence": {
-        "type": "integer"
-      },
-      "DeviceSeen": {
-        "type": "keyword"
-      },
-      "StartTime": {
-        "type": "date"
-      },
-      "EndTime": {
-        "type": "date"
-      },
-      "DevicesSeen": {
-        "type": "short"
-      },
-      "MessagesSeenTotal": {
-        "type": "short"
-      },
-      "MessagesSeenUnique": {
-        "type": "short"
-      },
-      "MessagesFailed": {
-        "type": "short"
-      }
+  "properties": {
+    "@timestamp": {
+      "type": "date"
+    },
+    "type": {
+      "type": "keyword"
+    },
+    "DevAddr": {
+      "type": "keyword"
+    },
+    "SNR": {
+      "type": "half_float"
+    },
+    "RSSI": {
+      "type": "half_float"
+    },
+    "ToA": {
+      "type": "half_float"
+    },
+    "ADR": {
+      "type": "boolean"
+    },
+    "MType": {
+      "type": "keyword"
+    },
+    "CRC": {
+      "type": "keyword"
+    },
+    "FCnt": {
+      "type": "integer"
+    },
+    "Freq": {
+      "type": "half_float"
+    },
+    "SF": {
+      "type": "byte"
+    },
+    "StartTime": {
+      "type": "date"
+    },
+    "EndTime": {
+      "type": "date"
+    },
+    "DevSeen": {
+      "type": "short"
+    },
+    "Util": {
+      "type": "float"
+    },
+    "MsgTotal": {
+      "type": "short"
+    },
+    "MsgUnique": {
+      "type": "short"
+    },
+    "MsgFailed": {
+      "type": "short"
+    },
+    "tm_cpu": {
+      "type": "half_float"
+    },
+    "tmp_cel": {
+      "type": "half_float"
+    },
+    "ram_used": {
+      "type": "short"
+    },
+    "ram_free": {
+      "type": "short"
     }
   }
-  
+}
