@@ -93,7 +93,9 @@ Maintainer: Sylvain Miermont
 /* JSON key fields for gateway report information */
 #define JSON_TMP_CPU        "temp_cpu"
 #define JSON_TMP_CEL        "temp_cel"
-#define JSON_RAM_UTIL       "ram"    
+#define JSON_TMP_CON        "temp_con"
+#define JSON_RAM_TOTL       "ram_totl"
+#define JSON_RAM_FREE       "ram_free"  
 // what other fields could I get?
 // rssi for the cell chip?
 // 
@@ -657,9 +659,8 @@ static void create_gw_report (void) {
     char* timestamp = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
 
     /* Variables for utilisation and statistics  */
-    float temp_cpu;
-    float temp_cel;
-    float ram;
+    float temp_cpu, temp_cel, temp_con;
+    float ram_free, ram_used;
     struct timespec fetch_time;
     struct tm *xt;
 
@@ -677,7 +678,9 @@ static void create_gw_report (void) {
     json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_GW);
     json_object_set_number(root_object, JSON_TMP_CPU,   temp_cpu);
     json_object_set_number(root_object, JSON_TMP_CEL,   temp_cel);
-    json_object_set_number(root_object, JSON_RAM_UTIL,  ram);
+    json_object_set_number(root_object, JSON_TMP_CON,   temp_con);
+    json_object_set_number(root_object, JSON_RAM_USED,  ram_used);
+    json_object_set_number(root_object, JSON_RAM_USED,  ram_free);
     
     serialized_string = json_serialize_to_string(root_value);
     fputs(serialized_string, file);
@@ -2058,7 +2061,7 @@ void thread_spectral_scan(void) {
 int main(int argc, char **argv) {
 
     /* return management variable */
-    int i, j;
+    int i;
 
     /* configuration file related */
     const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
@@ -2219,7 +2222,8 @@ int main(int argc, char **argv) {
     }
 
     /* Wait for ED encoding thread to end */
-    i = pthread_join(thrid_encode, NULL);
+    i = pthread_detach(thrid_encode);
+    // i = pthread_join(thrid_encode, NULL);
     if (i != 0) {
         printf("ERROR: failed to join ED encoding upstream thread with %d - %s\n", i, strerror(errno));
     }

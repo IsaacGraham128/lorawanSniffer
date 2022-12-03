@@ -63,7 +63,10 @@
     "tmp_cel": {
       "type": "half_float"
     },
-    "ram_used": {
+    "tmp_con": {
+      "type": "half_float"
+    },
+    "ram_tot": {
       "type": "short"
     },
     "ram_free": {
