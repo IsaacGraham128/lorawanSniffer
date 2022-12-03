@@ -49,7 +49,7 @@ Maintainer: Sylvain Miermont
 /* --- PRIVATE MACROS ------------------------------------------------------- */
 
 #define ARRAY_SIZE(a)   (sizeof(a) / sizeof((a)[0]))
-#define MSG(args...)    fprintf(stderr,"loragw_pkt_logger: " args) /* message that is destined to the user */
+#define MSG(args...)    fprintf(stderr,"sniffer: " args) /* message that is destined to the user */
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE CONSTANTS ---------------------------------------------------- */
@@ -316,6 +316,11 @@ static char report_string[50];
 static int ed_reports = 0;
 static int ch_reports = 0;
 
+/* JSOn statistics */
+static int ed_reports_total = 0;
+static int ch_reports_total = 0;
+
+
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE STATISTIC VARIABLES (GLOBAL) --------------------------------- */
@@ -332,11 +337,13 @@ static int ch_reports = 0;
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DECLARATION ---------------------------------------- */
+
+/* General runtime functions */
 static void usage (void);
 
 static void sig_handler(int sigio);
 
-static void create_file_string(char* file_type, int index);
+/* End device report writing object handlers */
 
 static ed_report_t* create_ed_report(void);
 
@@ -346,6 +353,20 @@ static void reset_ed_report(ed_report_t* report);
 
 static void destroy_ed_report(ed_report_t* report);
 
+/* Channel report struct objects */
+
+static void create_ch_report(void);
+
+static void write_ch_report(ed_report_t* report, struct lgw_pkt_rx_s* pkt);
+
+static void reset_ch_report(void);
+
+static void destroy_ch_report(void);
+
+/* Report object encoding functions */
+
+static void create_file_string(char* file_type, int index);
+
 static void encode_ed_report(ed_report_t *info, int index);
 
 static void encode_ch_report(ch_report_t *info, int index);
@@ -354,9 +375,7 @@ static void create_gw_report (void);
 
 static void create_all_channel_reports(void);
 
-static void ch_report_structs_init (void);
-
-static void ch_report_structs_cleanup (void);
+/* Auxilliary help functions*/
 
 static uint8_t find_channel_no(uint32_t freq);
 
@@ -364,15 +383,21 @@ static int start_sniffer(void);
 
 static int stop_sniffer(void);
 
+/* Radio configuration functions */
+
+static int init_radio_group(int group);
+
 static void stat_cleanup(void);
 
-static int init_radio_group (int group);
+/* Configuration parsing files */
 
 static int parse_SX130x_configuration(const char * conf_file);
 
 static int parse_gateway_configuration(const char * conf_file);
 
 static int parse_debug_configuration(const char * conf_file);
+
+/* Auxiliary GPS thread functions */
 
 static void gps_process_sync(void);
 
@@ -727,16 +752,13 @@ static void create_all_channel_reports(void) {
  * Create all of the necessary channel report information structs used to store
  * information necessary to generating the channel report info
 */
-static void ch_report_structs_init (void) {
+static void create_ch_report (void) {
 
     ch_info_t *ch_info;
     uint32_t radio_0_freq, radio_1_freq;
-    struct tm *xt;
     struct timespec fetch_time;
 
     clock_gettime(CLOCK_REALTIME, &fetch_time);
-    xt = gmtime(&(fetch_time.tv_sec));
-    printf("Call in main pre loop (again) %04i-%02i-%02i %02i:%02i:%02i.%03liZ\n",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
     
     radio_0_freq = rfconf[radio_group_current][0].freq_hz;
     radio_1_freq = rfconf[radio_group_current][1].freq_hz;
@@ -747,13 +769,13 @@ static void ch_report_structs_init (void) {
             ch_info = &ch_report_info[i][j];
             
             // Clear the memory and set the variables
-            memset((void*)ch_info, 0, sizeof(ch_info_t));
+            // Could alternatively use a memset?
             ch_info->start_time = fetch_time;
             ch_info->devices = (lora_device_t*)calloc(INFO_ARRAY_DEFAULT, sizeof(lora_device_t));
             ch_info->list_len = INFO_ARRAY_DEFAULT;
             ch_info->freq = if_info[i].radio ? radio_1_freq : radio_0_freq;
             ch_info->freq = (ch_info->freq + if_info[i].freq_if) / 1e6;
-            ch_info->sf = (SF_BASE + j) ;
+            ch_info->sf = (SF_BASE + j);
             ch_info->total_airtime = 0;
             ch_info->device_count = 0;
             ch_info->msg_total = 0;
@@ -764,9 +786,117 @@ static void ch_report_structs_init (void) {
 }
 
 /**
+ * Update channel report struct given a recieved packet.
+ * 
+ * @param   report  The encoded packet information
+ * @param   p       The raw packet information
+*/
+static void write_ch_report (ed_report_t* report, struct lgw_pkt_rx_s* p) {
+
+    ch_info_t *ch_info;
+    lora_device_t *ch_device;
+    bool dev_found = false;
+    uint32_t mote_addr;
+
+    for (int i = 0; i < LGW_MULTI_NB; i++) {
+        if (report->freq == ch_report_info[i][0].freq) {
+
+            ch_info = &ch_report_info[i][report->sf - SF_BASE];
+
+            /* Get device address */
+            mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
+
+            //printf("Altering channel report for %.1fHz @ SF:%d\n", ch_info->freq, ch_info->sf);
+            /* increment channel airtime */
+            ch_info->total_airtime += report->toa / 1e3; // Convert to seconds
+
+            /* find if the device already exists in this ch reports memory */
+            for (uint32_t g = 0; g < ch_info->device_count + 1; g++) {
+                if (ch_info->devices[g].device_adr == mote_addr) {
+                    ch_device = &ch_info->devices[g];
+                    dev_found = true;
+                    break;
+                }
+            }
+
+            /* increment our message counters */
+            ch_info->msg_total++;
+            if (p->status != STAT_CRC_OK) {
+                ch_info->msg_failed++;
+            }
+
+            /* handle counters and device listing memory */
+            if (dev_found) {
+                // printf("Already known device found, handling...\n");
+                if (report->fcnt != ch_device->fcnt) {
+                    // printf("New FCnt (%d) recieved!!\n", report->fcnt);
+                    ch_device->fcnt = report->fcnt;
+                    ch_info->msg_unique++;
+                } else {
+                    // printf("Duplicate FCnt (%d) recieved\n", report->fcnt);
+                }
+                dev_found = false; // set to false for next device analysis
+            } else {
+                // printf("New device found, adding and readjusting...\n");
+                ch_info->devices[ch_info->device_count].device_adr = mote_addr;
+                ch_info->devices[ch_info->device_count].fcnt = report->fcnt;
+                ch_info->device_count++;
+
+                /* check list size, realloc if we have filled the buffer */
+                if (ch_info->device_count == ch_info->list_len) {
+                    // printf("Old length was %d\n", ch_info->list_len);
+                    ch_info->list_len *= INFO_ARRAY_SCALER;
+                    // printf("New length was %d\n", ch_info->list_len);
+                    ch_info->devices_tmp = (lora_device_t*)realloc(ch_info->devices, ch_info->list_len * sizeof(lora_device_t));
+                    if (ch_info->devices_tmp == NULL) {
+                        MSG("Realloc failed\n");
+                        exit(EXIT_FAILURE);
+                    }
+                    ch_info->devices = ch_info->devices_tmp;
+                }
+            }
+
+            break;
+        }
+    }
+}
+
+/**
+ * Assign new timestamp and (if messages were caught) clear associated statistic memory. 
+ * Use when entering a new listening period.
+*/
+static void reset_ch_report (void) {
+
+    ch_info_t *ch_info;
+    struct timespec fetch_time;
+
+    clock_gettime(CLOCK_REALTIME, &fetch_time);
+
+    for (int i = 0; i < LGW_MULTI_NB; i++) {
+        for (int j = 0; j < SF_COUNT; j++) {
+
+            ch_info = &ch_report_info[i][j];
+
+            /* Set new timestamp */
+            ch_info->start_time = fetch_time;
+
+            /* If device count higher than 0, clear all tracking fields and clear array memory */
+            if (ch_info->device_count) {
+                ch_info->devices = (lora_device_t*)calloc(ch_info->list_len, sizeof(lora_device_t));
+                ch_info->total_airtime = 0;
+                ch_info->device_count = 0;
+                ch_info->msg_total = 0;
+                ch_info->msg_unique = 0;
+                ch_info->msg_failed = 0;
+            }
+        }
+    }
+}
+
+/**
  * Cleanup allocated memory given to each ch_info piece
 */
-static void ch_report_structs_cleanup (void) {
+static void destroy_ch_report (void) {
 
     for (int i = 0; i < LGW_MULTI_NB; i++) {
         for (int j = 0; j < SF_COUNT; j++) {
@@ -1529,6 +1659,9 @@ void thread_encode(void) {
             write_ed_report(report, &pkt_encode->rx_pkt, xt, &pkt_utc_time);
             encode_ed_report(report, ed_reports++);
 
+            /* Update the appropriate channel aggregate info */
+            write_ch_report(report, &pkt_encode->rx_pkt);
+
             /* traverse STAILQ and cleanup old queue entry */
             pkt_next = STAILQ_NEXT(pkt_encode, entries);
             STAILQ_REMOVE(&head, pkt_encode, entry, entries);
@@ -1549,18 +1682,38 @@ void thread_encode(void) {
 /* --- THREAD 1.11: Channel aggregate encoding and uploading JSONs ---------- */
 void thread_upload(void) {
 
-    // while (!exit_sig && !quit_sig) {
+    create_ch_report();
 
-    //     struct entry pkt_encode;
+    while (!exit_sig && !quit_sig) {
+        wait_ms(1000 * stat_interval);
 
-    //     pthread_mutex_lock(&mx_report_dev);
-    //     if (STAILQ_EMPTY(&head) == 0) {
-            
+        /* Acquire channel locks */
+        pthread_mutex_lock(&mx_report_ch);
+        
+        /* Generate all reports for channels */
+        create_all_channel_reports();
 
-    //     }
-    //     pthread_mutex_unlock(&mx_report_dev);
-    // }
+        /* Generate gateway statistic report */
 
+        /* Upload reports */
+
+        /* Delete reports */
+
+        /* Log data to file */
+        ed_reports_total += ed_reports;
+        ch_reports_total += ch_reports;
+
+        /* Cleanup of any data structures to prep for next upload */
+        reset_ch_report();
+        ed_reports = 0;
+        ch_reports = 0;
+        
+
+        pthread_mutex_unlock(&mx_report_ch);
+    }
+
+    destroy_ch_report();
+    MSG("\nINFO: End of uploading thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1914,6 +2067,7 @@ int main(int argc, char **argv) {
     /* threads */
     pthread_t thrid_listen;
     pthread_t thrid_encode;
+    pthread_t thrid_upload;
     pthread_t thrid_gps;
     pthread_t thrid_valid;
     pthread_t thrid_spectral;
@@ -1983,11 +2137,12 @@ int main(int argc, char **argv) {
     /* opening log file and writing CSV header*/
     //time(&now_time);
 
-
-
-    ch_report_structs_init();
-
-    // ch_report_structs_cleanup();
+    /* channel and gateway info encoding and uploading thread */
+    i = pthread_create(&thrid_upload, NULL, (void * (*)(void *))thread_upload, NULL);
+    if (i != 0) {
+        MSG("ERROR: [main] impossible to create uploading thread\n");
+        exit(EXIT_FAILURE);
+    }
 
     /* end device encoding thread */
     i = pthread_create(&thrid_encode, NULL, (void * (*)(void *))thread_encode, NULL);
@@ -2063,11 +2218,24 @@ int main(int argc, char **argv) {
         pthread_mutex_unlock(&mx_concent);
     }
 
+    /* Wait for ED encoding thread to end */
+    i = pthread_join(thrid_encode, NULL);
+    if (i != 0) {
+        printf("ERROR: failed to join ED encoding upstream thread with %d - %s\n", i, strerror(errno));
+    }
+
+    /* Wait for uploading thread to end */
+    i = pthread_join(thrid_upload, NULL);
+    if (i != 0) {
+        printf("ERROR: failed to join uploading upstream thread with %d - %s\n", i, strerror(errno));
+    }
+
     /* Get all of our main concentrator listening threads to close */
     i = pthread_join(thrid_listen, NULL);
     if (i != 0) {
-        printf("ERROR: failed to join upstream thread with %d - %s\n", i, strerror(errno));
+        printf("ERROR: failed to join LoRa listening upstream thread with %d - %s\n", i, strerror(errno));
     }
+
     if (spectral_scan_params.enable == true) {
         i = pthread_join(thrid_spectral, NULL);
         if (i != 0) {
@@ -2093,29 +2261,29 @@ int main(int argc, char **argv) {
         stat_cleanup();
     }
 
-    create_all_channel_reports();
+    // create_all_channel_reports();
 
-    printf("\n\n");
-    ch_info_t *ch_info;
+    // printf("\n\n");
+    // ch_info_t *ch_info;
 
-    for (i = 0; i < LGW_MULTI_NB; i++) {
-        for (j = 0; j < SF_COUNT; j++) {
-            if (ch_report_info[i][j].device_count) {
-                ch_info = &ch_report_info[i][j];
-                printf("Activity found on channel %.1fHz @ SF: %d\n", ch_info->freq, ch_info->sf);
+    // for (i = 0; i < LGW_MULTI_NB; i++) {
+    //     for (j = 0; j < SF_COUNT; j++) {
+    //         if (ch_report_info[i][j].device_count) {
+    //             ch_info = &ch_report_info[i][j];
+    //             printf("Activity found on channel %.1fHz @ SF: %d\n", ch_info->freq, ch_info->sf);
 
-                printf("Recieved messages from the following devices:\n");
+    //             printf("Recieved messages from the following devices:\n");
 
-                for(uint32_t g = 0; g < ch_info->device_count; g++) {
-                    printf("%x, ", ch_info->devices[g].device_adr);
-                }
-                printf("\n");
-                printf("Message total: %d (unique: %d, failed: %d)\n", ch_info->msg_total, ch_info->msg_unique, ch_info->msg_failed);
-                printf("\n");
-            }
-        }
-    }
-    printf("\n\n");
+    //             for(uint32_t g = 0; g < ch_info->device_count; g++) {
+    //                 printf("%x, ", ch_info->devices[g].device_adr);
+    //             }
+    //             printf("\n");
+    //             printf("Message total: %d (unique: %d, failed: %d)\n", ch_info->msg_total, ch_info->msg_unique, ch_info->msg_failed);
+    //             printf("\n");
+    //         }
+    //     }
+    // }
+    // printf("\n\n");
 
     /* message queue deinitialisation */
     STAILQ_INIT(&head);
