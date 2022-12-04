@@ -26,7 +26,7 @@ Maintainer: Sylvain Miermont
 
 #include <stdint.h>     /* C99 types */
 #include <stdbool.h>    /* bool type */
-#include <stdio.h>      /* printf fprintf sprintf fopen fputs */
+#include <stdio.h>      /* printf fprintf sprintf fopen fputs getline */
 
 #include <string.h>     /* memset */
 #include <signal.h>     /* sigaction */
@@ -38,6 +38,8 @@ Maintainer: Sylvain Miermont
 
 #include <pthread.h>
 #include <sys/queue.h>  /* STAILQ queue */
+
+#include <ctype.h>      /* isdigit */
 
 #include "parson.h"
 #include "base64.h"
@@ -51,12 +53,27 @@ Maintainer: Sylvain Miermont
 #define ARRAY_SIZE(a)   (sizeof(a) / sizeof((a)[0]))
 #define MSG(args...)    fprintf(stderr,"sniffer: " args) /* message that is destined to the user */
 
+#define print_log(format, ...) {                                                                    \
+    time_t ltime = time(NULL);                                                                      \
+    char *time_str = ctime(&ltime);                                                                 \
+    time_str[strlen(time_str)-1] = '\0';                                                            \
+    if (verbose) {                                                                                  \
+        fprintf(stdout, "%s: " format , time_str __VA_OPT__(,) __VA_ARGS__);                        \
+    }                                                                                               \
+    fprintf(log_file, "%s: " format , time_str __VA_OPT__(,) __VA_ARGS__);                            \
+}                                                                                                   \
+
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE CONSTANTS ---------------------------------------------------- */
 
 #ifndef VERSION_STRING
     #define VERSION_STRING "undefined"
 #endif
+
+#define OPTION_ARGS         "vhc:"
+
+#define FILE_CPU_TEMP       "/proc/meminfo"
+#define FILE_RAM_INFO       "/sys/class/thermal/thermal_zone0/temp"
 
 #define JSON_CONF_DEFAULT   "conf.json"
 
@@ -248,16 +265,16 @@ static pthread_mutex_t mx_report_ch = PTHREAD_MUTEX_INITIALIZER;  /* control acc
 STAILQ_HEAD(stailhead, entry);
 static struct stailhead head;
 
-
 /* configuration variables needed by the application  */
 static uint64_t lgwm = 0; /* LoRa gateway MAC address */
-static char lgwm_str[17];
+// static char lgwm_str[17];
 
 /* clock and log file management */
+static bool verbose = false;
 static time_t now_time;
 static time_t log_start_time;
 static FILE * log_file = NULL;
-static char log_file_name[64];
+static char log_file_name[128];
 
 /* hardware access control and correction */
 // TODOD : What happens if this is made static??
@@ -341,9 +358,14 @@ static int ch_reports_total = 0;
 /* --- PRIVATE FUNCTIONS DECLARATION ---------------------------------------- */
 
 /* General runtime functions */
-static void usage (void);
+static void usage(void);
 
 static void sig_handler(int sigio);
+
+/* Gateway statistic gathering functions (ram available and total)*/
+float get_ram_value(char* str);
+
+float get_cpu_temp (void);
 
 /* End device report writing object handlers */
 
@@ -373,7 +395,7 @@ static void encode_ed_report(ed_report_t *info, int index);
 
 static void encode_ch_report(ch_report_t *info, int index);
 
-static void create_gw_report (void);
+static void create_gw_report(void);
 
 static void create_all_channel_reports(void);
 
@@ -435,6 +457,52 @@ static void sig_handler(int sigio) {
         exit_sig = true;
     }
     return;
+}
+
+/**
+ * Get the ram utilisation values found in /proc/meminfo by passing in the current
+ * file reading line. Should be used in conjunction with getline().
+ * 
+ * @param str   Pointer to the current file line
+ * @return      The utilisation value in MiB
+*/
+float get_ram_value(char* str) {
+
+    char* num;
+    float value = 0;
+
+    num = str;
+
+    while (*num) {
+        if (isdigit(*num)) {
+            value = strtol(num, &num, 10);
+            break;
+        }
+        num++;
+    }
+
+    return value;
+}
+
+/**
+ * Get the current CPU temperature.
+ * 
+ * @return  The current CPU temperature in degrees.
+*/
+float get_cpu_temp (void) {
+
+    FILE* stream;
+    char *line, *num;
+    size_t len, nread;
+    float value = 0;
+
+    stream = fopen(FILE_CPU_TEMP, "r");
+
+    nread = getline(&line, &len, stream);
+    num = line;
+    value = (float)strtol(num, &num, 10) / 1000.0;
+
+    return value;
 }
 
 /**
@@ -679,8 +747,8 @@ static void create_gw_report (void) {
     json_object_set_number(root_object, JSON_TMP_CPU,   temp_cpu);
     json_object_set_number(root_object, JSON_TMP_CEL,   temp_cel);
     json_object_set_number(root_object, JSON_TMP_CON,   temp_con);
-    json_object_set_number(root_object, JSON_RAM_USED,  ram_used);
-    json_object_set_number(root_object, JSON_RAM_USED,  ram_free);
+    json_object_set_number(root_object, JSON_RAM_TOTL,  ram_used);
+    json_object_set_number(root_object, JSON_RAM_FREE,  ram_free);
     
     serialized_string = json_serialize_to_string(root_value);
     fputs(serialized_string, file);
@@ -1530,14 +1598,14 @@ static int parse_debug_configuration(const char * conf_file) {
     return 0;
 }
 
-void open_log(void) {
+void log_open (void) {
     int i;
     char iso_date[20];
 
     strftime(iso_date,ARRAY_SIZE(iso_date),"%Y%m%dT%H%M%SZ",gmtime(&now_time)); /* format yyyymmddThhmmssZ */
     log_start_time = now_time; /* keep track of when the log was started, for log rotation */
 
-    sprintf(log_file_name, "pktlog_%s_%s.csv", lgwm_str, iso_date);
+    sprintf(log_file_name, "sniffer_log_%s.txt", iso_date);
     log_file = fopen(log_file_name, "a"); /* create log file, append if file already exist */
     if (log_file == NULL) {
         MSG("ERROR: impossible to create log file %s\n", log_file_name);
@@ -1552,6 +1620,18 @@ void open_log(void) {
 
     MSG("INFO: Now writing to log file %s\n", log_file_name);
     return;
+}
+
+void log_close (void) {
+
+    int i;
+
+    i = fclose(log_file);
+
+    if (i < 0) {
+        MSG("ERROR: Failed to close log file\n");
+        exit(EXIT_FAILURE);
+    }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2078,11 +2158,18 @@ int main(int argc, char **argv) {
     /* message queue initialisation */
     STAILQ_INIT(&head);
 
+    
+
     /* parse command line options */
-    while( (i = getopt( argc, argv, "hc:" )) != -1 )
+    while( (i = getopt( argc, argv, OPTION_ARGS )) != -1 )
     {
         switch( i )
         {
+        case 'v':
+        verbose =  true;
+        printf("Its verbosin' time!\n");
+        break;
+
         case 'h':
             usage( );
             return EXIT_SUCCESS;
@@ -2098,6 +2185,16 @@ int main(int argc, char **argv) {
             return EXIT_FAILURE;
         }
     }
+
+    log_open();
+
+    print_log("this is a test of sorts\n");
+
+    print_log("this is a test with %d numbers!%d\n", 2, 1);
+
+    log_close();
+
+    return EXIT_SUCCESS;
 
     /* configuration files management */
     if (access(conf_fname, R_OK) == 0) { /* if there is a global conf, parse it  */

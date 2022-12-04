@@ -1,6 +1,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
 
 #include "parson.h"
 
@@ -9,11 +11,70 @@
 
 int main(int argc, char **argv) {
 
-    char* line;
-    ssize_t length;
-    FILE* file = fopen("/proc/meminfo", "r");
+    FILE* stream;
+    char* line = NULL;
+    size_t len = 0;
+    size_t nread;
+    char *num;
+    long value = 0;
 
+    stream = fopen("/proc/meminfo", "r");
+
+    if (stream == NULL) {
+        perror("fopen");
+        exit(EXIT_FAILURE);
+    }
+
+    nread = getline(&line, &len, stream);
+
+    num = line;
+
+    printf("num is %s\n", num);
+
+    while (*num) {
+        if (isdigit(*num)) {
+            value = strtol(num, &num, 10);
+            break;
+        }
+        num++;
+    }
+
+    printf("Found number was %ld\n", value);
+    printf("Total in MiBi is %.0f\n", (float)(value / 1024));
+
+    nread = getline(&line, &len, stream);
+
+    nread = getline(&line, &len, stream);
+
+    num = line;
+
+    while (*num) {
+        if (isdigit(*num)) {
+            value = strtol(num, &num, 10);
+            break;
+        }
+        num++;
+    }
+
+    printf("Found number was %ld\n", value);
+    printf("Available in MiBi is %.0f\n", (float)(value / 1024));
+
+    // printf("Got line of length %zd\n", nread);
+    // fwrite(line, nread, 1, stdout);
     // length = getline
+
+    free(line);
+    fclose(stream);
+
+    stream = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+
+    nread = getline(&line, &len, stream);
+
+    num = line;
+
+    value = strtol(num, &num, 10);
+
+    printf("CPU temp is %.3f\n", (float)value / 1000.0);
 
     // char buffer[50];
     // char num_buffer[50];
