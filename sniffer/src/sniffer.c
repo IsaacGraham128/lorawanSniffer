@@ -19,7 +19,7 @@ Maintainer: Sylvain Miermont
 
 /* fix an issue between POSIX and C99 */
 #if __STDC_VERSION__ >= 199901L
-    #define _XOPEN_SOURCE 600
+    #define _XOPEN_SOURCE 700
 #else
     #define _XOPEN_SOURCE 500
 #endif
@@ -51,16 +51,22 @@ Maintainer: Sylvain Miermont
 /* --- PRIVATE MACROS ------------------------------------------------------- */
 
 #define ARRAY_SIZE(a)   (sizeof(a) / sizeof((a)[0]))
-#define MSG(args...)    fprintf(stderr,"sniffer: " args) /* message that is destined to the user */
 
+/* message macros that utilise the wider logging function */
+#define MSG_INFO(format, ...)   print_log("INFO: " format __VA_OPT__(,) __VA_ARGS__)
+#define MSG_WARN(format, ...)   print_log("WARNING: " format __VA_OPT__(,) __VA_ARGS__)
+#define MSG_ERR(format, ...)    print_log("ERROR: " format __VA_OPT__(,) __VA_ARGS__)
+#define MSG_LOG(format, ...)    print_log("LOG: " format __VA_OPT__(,) __VA_ARGS__)
+
+/* Logging macro function */
 #define print_log(format, ...) {                                                                    \
     time_t ltime = time(NULL);                                                                      \
     char *time_str = ctime(&ltime);                                                                 \
     time_str[strlen(time_str)-1] = '\0';                                                            \
     if (verbose) {                                                                                  \
-        fprintf(stdout, "%s: " format , time_str __VA_OPT__(,) __VA_ARGS__);                        \
+        fprintf(stdout, format __VA_OPT__(,) __VA_ARGS__);                                          \
     }                                                                                               \
-    fprintf(log_file, "%s: " format , time_str __VA_OPT__(,) __VA_ARGS__);                            \
+    fprintf(log_file, "%s - " format , time_str __VA_OPT__(,) __VA_ARGS__);                         \
 }                                                                                                   \
 
 /* -------------------------------------------------------------------------- */
@@ -126,7 +132,8 @@ Maintainer: Sylvain Miermont
 #define GPS_REF_MAX_AGE     30          /* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
 #define XERR_INIT_AVG       16          /* nb of measurements the XTAL correction is averaged on as initial value */
 #define XERR_FILT_COEF      256         /* coefficient for low-pass XTAL error tracking */
-#define DEFAULT_STAT        30          /* default time interval for statistics */
+#define DEFAULT_INT_REPORT  900         /* default time interval (seconds) for report uploading */
+#define DEFAULT_INT_LOG     1800        /* default time interval (seconds) for log usage */
 
 #define SF_COUNT            6           /* Number of spreading factors to be used */ 
 #define SF_BASE             7           /* Lowest SF (7->12) */
@@ -208,6 +215,7 @@ typedef struct ch_info_s {
     uint32_t msg_failed; 
 } ch_info_t;
 
+/* struct for holding radio information configuration */
 typedef struct if_info_s {
     uint8_t radio;
     int32_t freq_if;
@@ -219,40 +227,12 @@ struct entry {
     STAILQ_ENTRY(entry) entries;
 };
 
-
-
-/* device management */
-// typedef struct lora_device_s {
-//     uint32_t        device_adr;
-//     uint16_t        fcnt;
-//     bool            adr_status;
-// } lora_device_t;
-
-// /* spreading factor data reading */
-// /* backup pointers are used in cases where a realloc is required for more space */
-// typedef struct freq_data_s {
-//     uint32_t        freq_hz;                        /* Frequency of this spreading factor */
-//     uint8_t         sf;                             /* Spreading factor entry */
-//     uint16_t        devices_seen;                   /* Number of seen devices */
-//     uint16_t        devices_len;                    /* Current length of the devices array */
-//     uint16_t        messages_seen;                  /* Number of messages seen */
-//     uint16_t        messages_len;                   /* Current length of the RSSI and SNR arrays */
-//     uint16_t        unique_messages_seen;           /* Number of messages with unique FCnts */
-//     uint32_t        message_last_seen;              /* Timestamp of last message recieved */
-//     uint32_t        *devices;                       /* List of device addresses seen */
-//     float           *RSSI;                          /* List of RSSI values of recieved messages */
-//     float           *SNR;                           /* List of SNR values of recieved messages */
-//     bool            realloc;                        /* Flag to indicate the backups are in use due to REALLOC */
-//     lora_device_t   *b_devices;                     /* Backup list of devices seen */
-//     float           *b_RSSI;                        /* Backup list of RSSI values of recieved messages */
-//     float           *b_SNR;                         /* Backup list of SNR values of recieved messages */
-// } freq_data_t;
-
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE VARIABLES (GLOBAL) ------------------------------------------- */
 
 /* statistics collection configuration variables */
-static unsigned stat_interval = DEFAULT_STAT; /* time interval (in sec) at which statistics are collected and displayed */
+static unsigned report_interval = DEFAULT_INT_REPORT; /* time interval (in sec) at which reports are uploaded */
+static unsigned log_interval = DEFAULT_INT_LOG; /* time interval (in sec) at which new log files are used */
 
 /* signal handling variables */
 struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
@@ -270,9 +250,8 @@ static uint64_t lgwm = 0; /* LoRa gateway MAC address */
 // static char lgwm_str[17];
 
 /* clock and log file management */
+static pthread_mutex_t mx_log = PTHREAD_MUTEX_INITIALIZER; /* control access to the log file */
 static bool verbose = false;
-static time_t now_time;
-static time_t log_start_time;
 static FILE * log_file = NULL;
 static char log_file_name[128];
 
@@ -421,6 +400,12 @@ static int parse_gateway_configuration(const char * conf_file);
 
 static int parse_debug_configuration(const char * conf_file);
 
+/* Log file interaction */
+static void log_open (void);
+
+static void log_close (void);
+
+
 /* Auxiliary GPS thread functions */
 
 static void gps_process_sync(void);
@@ -493,12 +478,12 @@ float get_cpu_temp (void) {
 
     FILE* stream;
     char *line, *num;
-    size_t len, nread;
+    size_t len;
     float value = 0;
 
     stream = fopen(FILE_CPU_TEMP, "r");
 
-    nread = getline(&line, &len, stream);
+    getline(&line, &len, stream);
     num = line;
     value = (float)strtol(num, &num, 10) / 1000.0;
 
@@ -600,7 +585,7 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
         case DR_LORA_SF10:  airtime = airtime / BITRATE_DR2; break;
         case DR_LORA_SF11:  airtime = airtime / BITRATE_DR1; break;
         case DR_LORA_SF12:  airtime = airtime / BITRATE_DR0; break;
-        default:            printf("ERR");
+        default:            MSG_ERR("Unknown spreading factor found");
     }
 
     report->toa = airtime * 1e3; // In ms 
@@ -803,10 +788,6 @@ static void create_all_channel_reports(void) {
 
                 utilisation = ch_info->total_airtime / (float)(fetch_time.tv_sec - ch_info->start_time.tv_sec);
 
-                printf("The channel activity airtime was %f\n", ch_info->total_airtime);
-                printf("The channel duration was %f\n", (float)(fetch_time.tv_sec - ch_info->start_time.tv_sec));
-                printf("Hence the util was %f percent\n", utilisation * 1e2);
-
                 ch_report->utilisation = utilisation * 1e2; // Move up to percentile
 
                 encode_ch_report(ch_report, ch_reports++);
@@ -877,7 +858,6 @@ static void write_ch_report (ed_report_t* report, struct lgw_pkt_rx_s* p) {
             /* Get device address */
             mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
 
-            //printf("Altering channel report for %.1fHz @ SF:%d\n", ch_info->freq, ch_info->sf);
             /* increment channel airtime */
             ch_info->total_airtime += report->toa / 1e3; // Convert to seconds
 
@@ -898,29 +878,22 @@ static void write_ch_report (ed_report_t* report, struct lgw_pkt_rx_s* p) {
 
             /* handle counters and device listing memory */
             if (dev_found) {
-                // printf("Already known device found, handling...\n");
                 if (report->fcnt != ch_device->fcnt) {
-                    // printf("New FCnt (%d) recieved!!\n", report->fcnt);
                     ch_device->fcnt = report->fcnt;
                     ch_info->msg_unique++;
-                } else {
-                    // printf("Duplicate FCnt (%d) recieved\n", report->fcnt);
                 }
                 dev_found = false; // set to false for next device analysis
             } else {
-                // printf("New device found, adding and readjusting...\n");
                 ch_info->devices[ch_info->device_count].device_adr = mote_addr;
                 ch_info->devices[ch_info->device_count].fcnt = report->fcnt;
                 ch_info->device_count++;
 
                 /* check list size, realloc if we have filled the buffer */
                 if (ch_info->device_count == ch_info->list_len) {
-                    // printf("Old length was %d\n", ch_info->list_len);
                     ch_info->list_len *= INFO_ARRAY_SCALER;
-                    // printf("New length was %d\n", ch_info->list_len);
                     ch_info->devices_tmp = (lora_device_t*)realloc(ch_info->devices, ch_info->list_len * sizeof(lora_device_t));
                     if (ch_info->devices_tmp == NULL) {
-                        MSG("Realloc failed\n");
+                        MSG_ERR("Realloc failed\n");
                         exit(EXIT_FAILURE);
                     }
                     ch_info->devices = ch_info->devices_tmp;
@@ -997,9 +970,9 @@ static int start_sniffer(void) {
 
     i = lgw_start();
     if (i == LGW_HAL_SUCCESS) {
-        MSG("INFO: concentrator started, packet can now be received\n");
+        MSG_INFO("concentrator started, packet can now be received\n");
     } else {
-        MSG("ERROR: failed to start the concentrator\n");
+        MSG_ERR("failed to start the concentrator\n");
         return -1;
     }
 
@@ -1016,9 +989,9 @@ static int stop_sniffer(void) {
     int i;
     i = lgw_stop();
     if (i == LGW_HAL_SUCCESS) {
-        MSG("INFO: concentrator stopped successfully\n");
+        MSG_INFO("concentrator stopped successfully\n");
     } else {
-        MSG("WARNING: failed to stop concentrator successfully\n");
+        MSG_WARN("failed to stop concentrator successfully\n");
         return -1;
     }
 
@@ -1051,10 +1024,10 @@ static int init_radio_group (int group) {
 
     for (i = 0; i < LGW_RF_CHAIN_NB; i++) {
         if (lgw_rxrf_setconf(i, &rfconf[group][i]) != LGW_HAL_SUCCESS) {
-            MSG("ERROR: invalid configuration for radio %i\n", i);
+            MSG_ERR("invalid configuration for radio %i\n", i);
             return -1;
         } else {
-            MSG("INFO: Group %d radio %d configured correctly\n", group, i);
+            MSG_INFO("Group %d radio %d configured correctly\n", group, i);
         }
     }
 
@@ -1084,31 +1057,31 @@ static int parse_SX130x_configuration(const char * conf_file) {
     /* try to parse JSON */
     root_val = json_parse_file_with_comments(conf_file);
     if (root_val == NULL) {
-        MSG("ERROR: %s is not a valid JSON file\n", conf_file);
+        MSG_ERR("%s is not a valid JSON file\n", conf_file);
         exit(EXIT_FAILURE);
     }
 
     /* point to the gateway configuration object */
     conf_obj = json_object_get_object(json_value_get_object(root_val), conf_obj_name);
     if (conf_obj == NULL) {
-        MSG("INFO: %s does not contain a JSON object named %s\n", conf_file, conf_obj_name);
+        MSG_INFO("%s does not contain a JSON object named %s\n", conf_file, conf_obj_name);
         return -1;
     } else {
-        MSG("INFO: %s does contain a JSON object named %s, parsing SX1302 parameters\n", conf_file, conf_obj_name);
+        MSG_INFO("%s does contain a JSON object named %s, parsing SX1302 parameters\n", conf_file, conf_obj_name);
     }
 
     /* set board configuration */
     memset(&boardconf, 0, sizeof boardconf); /* initialize configuration structure */
     str = json_object_get_string(conf_obj, "com_type");
     if (str == NULL) {
-        MSG("ERROR: com_type must be configured in %s\n", conf_file);
+        MSG_ERR("com_type must be configured in %s\n", conf_file);
         return -1;
     } else if (!strncmp(str, "SPI", 3) || !strncmp(str, "spi", 3)) {
         boardconf.com_type = LGW_COM_SPI;
     } else if (!strncmp(str, "USB", 3) || !strncmp(str, "usb", 3)) {
         boardconf.com_type = LGW_COM_USB;
     } else {
-        MSG("ERROR: invalid com type: %s (should be SPI or USB)\n", str);
+        MSG_ERR("invalid com type: %s (should be SPI or USB)\n", str);
         return -1;
     }
     com_type = boardconf.com_type;
@@ -1117,34 +1090,34 @@ static int parse_SX130x_configuration(const char * conf_file) {
         strncpy(boardconf.com_path, str, sizeof boardconf.com_path);
         boardconf.com_path[sizeof boardconf.com_path - 1] = '\0'; /* ensure string termination */
     } else {
-        MSG("ERROR: com_path must be configured in %s\n", conf_file);
+        MSG_ERR("com_path must be configured in %s\n", conf_file);
         return -1;
     }
     val = json_object_get_value(conf_obj, "lorawan_public"); /* fetch value (if possible) */
     if (json_value_get_type(val) == JSONBoolean) {
         boardconf.lorawan_public = (bool)json_value_get_boolean(val);
     } else {
-        MSG("WARNING: Data type for lorawan_public seems wrong, please check\n");
+        MSG_WARN("Data type for lorawan_public seems wrong, please check\n");
         boardconf.lorawan_public = false;
     }
     val = json_object_get_value(conf_obj, "clksrc"); /* fetch value (if possible) */
     if (json_value_get_type(val) == JSONNumber) {
         boardconf.clksrc = (uint8_t)json_value_get_number(val);
     } else {
-        MSG("WARNING: Data type for clksrc seems wrong, please check\n");
+        MSG_WARN("Data type for clksrc seems wrong, please check\n");
         boardconf.clksrc = 0;
     }
     val = json_object_get_value(conf_obj, "full_duplex"); /* fetch value (if possible) */
     if (json_value_get_type(val) == JSONBoolean) {
         boardconf.full_duplex = (bool)json_value_get_boolean(val);
     } else {
-        MSG("WARNING: Data type for full_duplex seems wrong, please check\n");
+        MSG_WARN("Data type for full_duplex seems wrong, please check\n");
         boardconf.full_duplex = false;
     }
-    MSG("INFO: com_type %s, com_path %s, lorawan_public %d, clksrc %d, full_duplex %d\n", (boardconf.com_type == LGW_COM_SPI) ? "SPI" : "USB", boardconf.com_path, boardconf.lorawan_public, boardconf.clksrc, boardconf.full_duplex);
+    MSG_INFO("com_type %s, com_path %s, lorawan_public %d, clksrc %d, full_duplex %d\n", (boardconf.com_type == LGW_COM_SPI) ? "SPI" : "USB", boardconf.com_path, boardconf.lorawan_public, boardconf.clksrc, boardconf.full_duplex);
     /* all parameters parsed, submitting configuration to the HAL */
     if (lgw_board_setconf(&boardconf) != LGW_HAL_SUCCESS) {
-        MSG("ERROR: Failed to configure board\n");
+        MSG_ERR("Failed to configure board\n");
         return -1;
     }
 
@@ -1154,46 +1127,46 @@ static int parse_SX130x_configuration(const char * conf_file) {
         if (json_value_get_type(val) == JSONNumber) {
             antenna_gain = (int8_t)json_value_get_number(val);
         } else {
-            MSG("WARNING: Data type for antenna_gain seems wrong, please check\n");
+            MSG_WARN("Data type for antenna_gain seems wrong, please check\n");
             antenna_gain = 0;
         }
     }
-    MSG("INFO: antenna_gain %d dBi\n", antenna_gain);
+    MSG_INFO("antenna_gain %d dBi\n", antenna_gain);
 
     /* set timestamp configuration */
     conf_ts_obj = json_object_get_object(conf_obj, "fine_timestamp");
     if (conf_ts_obj == NULL) {
-        MSG("INFO: %s does not contain a JSON object for fine timestamp\n", conf_file);
+        MSG_INFO("%s does not contain a JSON object for fine timestamp\n", conf_file);
     } else {
         val = json_object_get_value(conf_ts_obj, "enable"); /* fetch value (if possible) */
         if (json_value_get_type(val) == JSONBoolean) {
             tsconf.enable = (bool)json_value_get_boolean(val);
         } else {
-            MSG("WARNING: Data type for fine_timestamp.enable seems wrong, please check\n");
+            MSG_WARN("Data type for fine_timestamp.enable seems wrong, please check\n");
             tsconf.enable = false;
         }
         if (tsconf.enable == true) {
             str = json_object_get_string(conf_ts_obj, "mode");
             if (str == NULL) {
-                MSG("ERROR: fine_timestamp.mode must be configured in %s\n", conf_file);
+                MSG_ERR("fine_timestamp.mode must be configured in %s\n", conf_file);
                 return -1;
             } else if (!strncmp(str, "high_capacity", 13) || !strncmp(str, "HIGH_CAPACITY", 13)) {
                 tsconf.mode = LGW_FTIME_MODE_HIGH_CAPACITY;
             } else if (!strncmp(str, "all_sf", 6) || !strncmp(str, "ALL_SF", 6)) {
                 tsconf.mode = LGW_FTIME_MODE_ALL_SF;
             } else {
-                MSG("ERROR: invalid fine timestamp mode: %s (should be high_capacity or all_sf)\n", str);
+                MSG_ERR("invalid fine timestamp mode: %s (should be high_capacity or all_sf)\n", str);
                 return -1;
             }
-            MSG("INFO: Configuring precision timestamp with %s mode\n", str);
+            MSG_INFO("Configuring precision timestamp with %s mode\n", str);
 
             /* all parameters parsed, submitting configuration to the HAL */
             if (lgw_ftime_setconf(&tsconf) != LGW_HAL_SUCCESS) {
-                MSG("ERROR: Failed to configure fine timestamp\n");
+                MSG_ERR("Failed to configure fine timestamp\n");
                 return -1;
             }
         } else {
-            MSG("INFO: Configuring legacy timestamp\n");
+            MSG_INFO("Configuring legacy timestamp\n");
         }
     }
 
@@ -1201,7 +1174,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
     memset(&sx1261conf, 0, sizeof sx1261conf); /* initialize configuration structure */
     conf_sx1261_obj = json_object_get_object(conf_obj, "sx1261_conf"); /* fetch value (if possible) */
     if (conf_sx1261_obj == NULL) {
-        MSG("INFO: no configuration for SX1261\n");
+        MSG_INFO("no configuration for SX1261\n");
     } else {
         /* Global SX1261 configuration */
         str = json_object_get_string(conf_sx1261_obj, "spi_path");
@@ -1209,64 +1182,64 @@ static int parse_SX130x_configuration(const char * conf_file) {
             strncpy(sx1261conf.spi_path, str, sizeof sx1261conf.spi_path);
             sx1261conf.spi_path[sizeof sx1261conf.spi_path - 1] = '\0'; /* ensure string termination */
         } else {
-            MSG("INFO: SX1261 spi_path is not configured in %s\n", conf_file);
+            MSG_INFO("SX1261 spi_path is not configured in %s\n", conf_file);
         }
         val = json_object_get_value(conf_sx1261_obj, "rssi_offset"); /* fetch value (if possible) */
         if (json_value_get_type(val) == JSONNumber) {
             sx1261conf.rssi_offset = (int8_t)json_value_get_number(val);
         } else {
-            MSG("WARNING: Data type for sx1261_conf.rssi_offset seems wrong, please check\n");
+            MSG_WARN("Data type for sx1261_conf.rssi_offset seems wrong, please check\n");
             sx1261conf.rssi_offset = 0;
         }
 
         /* Spectral Scan configuration */
         conf_scan_obj = json_object_get_object(conf_sx1261_obj, "spectral_scan"); /* fetch value (if possible) */
         if (conf_scan_obj == NULL) {
-            MSG("INFO: no configuration for Spectral Scan\n");
+            MSG_INFO("no configuration for Spectral Scan\n");
         } else {
             val = json_object_get_value(conf_scan_obj, "enable"); /* fetch value (if possible) */
             if (json_value_get_type(val) == JSONBoolean) {
                 /* Enable background spectral scan thread in packet forwarder */
                 spectral_scan_params.enable = (bool)json_value_get_boolean(val);
             } else {
-                MSG("WARNING: Data type for spectral_scan.enable seems wrong, please check\n");
+                MSG_WARN("Data type for spectral_scan.enable seems wrong, please check\n");
             }
             if (spectral_scan_params.enable == true) {
                 /* Enable the sx1261 radio hardware configuration to allow spectral scan */
                 sx1261conf.enable = true;
-                MSG("INFO: Spectral Scan with SX1261 is enabled\n");
+                MSG_INFO("Spectral Scan with SX1261 is enabled\n");
 
                 /* Get Spectral Scan Parameters */
                 val = json_object_get_value(conf_scan_obj, "freq_start"); /* fetch value (if possible) */
                 if (json_value_get_type(val) == JSONNumber) {
                     spectral_scan_params.freq_hz_start = (uint32_t)json_value_get_number(val);
                 } else {
-                    MSG("WARNING: Data type for spectral_scan.freq_start seems wrong, please check\n");
+                    MSG_WARN("Data type for spectral_scan.freq_start seems wrong, please check\n");
                 }
                 val = json_object_get_value(conf_scan_obj, "nb_chan"); /* fetch value (if possible) */
                 if (json_value_get_type(val) == JSONNumber) {
                     spectral_scan_params.nb_chan = (uint8_t)json_value_get_number(val);
                 } else {
-                    MSG("WARNING: Data type for spectral_scan.nb_chan seems wrong, please check\n");
+                    MSG_WARN("Data type for spectral_scan.nb_chan seems wrong, please check\n");
                 }
                 val = json_object_get_value(conf_scan_obj, "nb_scan"); /* fetch value (if possible) */
                 if (json_value_get_type(val) == JSONNumber) {
                     spectral_scan_params.nb_scan = (uint16_t)json_value_get_number(val);
                 } else {
-                    MSG("WARNING: Data type for spectral_scan.nb_scan seems wrong, please check\n");
+                    MSG_WARN("Data type for spectral_scan.nb_scan seems wrong, please check\n");
                 }
                 val = json_object_get_value(conf_scan_obj, "pace_s"); /* fetch value (if possible) */
                 if (json_value_get_type(val) == JSONNumber) {
                     spectral_scan_params.pace_s = (uint32_t)json_value_get_number(val);
                 } else {
-                    MSG("WARNING: Data type for spectral_scan.pace_s seems wrong, please check\n");
+                    MSG_WARN("Data type for spectral_scan.pace_s seems wrong, please check\n");
                 }
             }
         }
 
         /* all parameters parsed, submitting configuration to the HAL */
         if (lgw_sx1261_setconf(&sx1261conf) != LGW_HAL_SUCCESS) {
-            MSG("ERROR: Failed to configure the SX1261 radio\n");
+            MSG_ERR("Failed to configure the SX1261 radio\n");
             return -1;
         }
     }
@@ -1275,27 +1248,27 @@ static int parse_SX130x_configuration(const char * conf_file) {
     val = json_object_dotget_value(conf_obj, "group_swapping");
     if (json_value_get_type(val) == JSONBoolean) {
         radio_group_swapping = (bool)json_value_get_boolean(val);
-        MSG("INFO: Radio group swapping is %s\n", radio_group_swapping ? "enabled" : "disabled");
+        MSG_INFO("Radio group swapping is %s\n", radio_group_swapping ? "enabled" : "disabled");
     } else {
-        MSG("INFO: No group swapping configuration, assuming false\n");
+        MSG_INFO("No group swapping configuration, assuming false\n");
     }
 
     val = json_object_dotget_value(conf_obj, "default_group");
     if (json_value_get_type(val) == JSONNumber) {
         radio_group_current = (int)json_value_get_number(val);
-        MSG("INFO: Custom radio group %d selected\n", radio_group_current);
+        MSG_INFO("Custom radio group %d selected\n", radio_group_current);
     } else {
         radio_group_current = DEFAULT_GROUP;
-        MSG("INFO: Utilising default radio group %d\n", radio_group_current);
+        MSG_INFO("Utilising default radio group %d\n", radio_group_current);
     }
 
     val = json_object_dotget_value(conf_obj, "radio_groups");
     if (json_value_get_type(val) == JSONNumber) {
         radio_group_count = (int)json_value_get_number(val);
-        MSG("INFO: %d radio groups given\n", radio_group_count);
+        MSG_INFO("%d radio groups given\n", radio_group_count);
     } else {
         radio_group_count = DEFAULT_GROUP_COUNT;
-        MSG("INFO: Utilising default radio group count %d\n", radio_group_count);
+        MSG_INFO("Utilising default radio group count %d\n", radio_group_count);
     }
 
     
@@ -1312,7 +1285,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
             snprintf(param_name, sizeof param_name, "radio_%d_%d", i, j); /* compose parameter path inside JSON structure */
             val = json_object_get_value(conf_obj, param_name); /* fetch value (if possible) */
             if (json_value_get_type(val) != JSONObject) {
-                MSG("INFO: no configuration for group %d radio %d\n", i, j);
+                MSG_INFO("no configuration for group %d radio %d\n", i, j);
                 number++;
                 continue;
             }
@@ -1325,7 +1298,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
                 rfconf[i][j].enable = false;
             }
             if (rfconf[i][j].enable == false) { /* radio disabsled, nothing else to parse */
-                MSG("INFO: Group %d radio %i disabled\n", i, j);
+                MSG_INFO("Group %d radio %i disabled\n", i, j);
             } else  { /* radio enabled, will parse the other parameters */
                 snprintf(param_name, sizeof param_name, "radio_%d_%d.freq", i, j);
                 rfconf[i][j].freq_hz = (uint32_t)json_object_dotget_number(conf_obj, param_name);
@@ -1350,7 +1323,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
                 } else if (!strncmp(str, "SX1250", 6)) {
                     rfconf[i][j].type = LGW_RADIO_TYPE_SX1250;
                 } else {
-                    MSG("WARNING: invalid radio type: %s (should be SX1255 or SX1257 or SX1250)\n", str);
+                    MSG_WARN("invalid radio type: %s (should be SX1255 or SX1257 or SX1250)\n", str);
                 }
                 snprintf(param_name, sizeof param_name, "radio_%d_%d.single_input_mode", i, j);
                 val = json_object_dotget_value(conf_obj, param_name);
@@ -1360,21 +1333,21 @@ static int parse_SX130x_configuration(const char * conf_file) {
                     rfconf[i][j].single_input_mode = false;
                 }
 
-                MSG("INFO: Group %d radio %d enabled (type %s), center frequency %u, RSSI offset %f\n", i, j, str, rfconf[i][j].freq_hz, rfconf[i][j].rssi_offset);
+                MSG_INFO("Group %d radio %d enabled (type %s), center frequency %u, RSSI offset %f\n", i, j, str, rfconf[i][j].freq_hz, rfconf[i][j].rssi_offset);
             }
         }
     }
 
     /* initialise the specific radio group */
     if (number == LGW_RF_CHAIN_NB * radio_group_count) {
-        MSG("ERROR: No valid radio configurations given\n");
+        MSG_ERR("No valid radio configurations given\n");
         return -1;
     } else {
-        MSG("INFO: %d radios configured\n", number);
+        MSG_INFO("%d radios configured\n", number);
     }
 
     if (init_radio_group(radio_group_current)) {
-        MSG("ERROR: Failed to initialise radio group %d\n", i);
+        MSG_ERR("Failed to initialise radio group %d\n", i);
         return -1;
     }
 
@@ -1382,14 +1355,14 @@ static int parse_SX130x_configuration(const char * conf_file) {
     memset(&demodconf, 0, sizeof demodconf); /* initialize configuration structure */
     val = json_object_get_value(conf_obj, "chan_multiSF_All"); /* fetch value (if possible) */
     if (json_value_get_type(val) != JSONObject) {
-        MSG("INFO: no configuration for LoRa multi-SF spreading factors enabling\n");
+        MSG_INFO("no configuration for LoRa multi-SF spreading factors enabling\n");
     } else {
         conf_demod_array = json_object_dotget_array(conf_obj, "chan_multiSF_All.spreading_factor_enable");
         if ((conf_demod_array != NULL) && ((size = json_array_get_count(conf_demod_array)) <= LGW_MULTI_NB)) {
             for (i = 0; i < (int)size; i++) {
                 number = json_array_get_number(conf_demod_array, i);
                 if (number < 5 || number > 12) {
-                    MSG("WARNING: failed to parse chan_multiSF_All.spreading_factor_enable (wrong value at idx %d)\n", i);
+                    MSG_WARN("failed to parse chan_multiSF_All.spreading_factor_enable (wrong value at idx %d)\n", i);
                     demodconf.multisf_datarate = 0xFF; /* enable all SFs */
                     break;
                 } else {
@@ -1398,12 +1371,12 @@ static int parse_SX130x_configuration(const char * conf_file) {
                 }
             }
         } else {
-            MSG("WARNING: failed to parse chan_multiSF_All.spreading_factor_enable\n");
+            MSG_WARN("failed to parse chan_multiSF_All.spreading_factor_enable\n");
             demodconf.multisf_datarate = 0xFF; /* enable all SFs */
         }
         /* all parameters parsed, submitting configuration to the HAL */
         if (lgw_demod_setconf(&demodconf) != LGW_HAL_SUCCESS) {
-            MSG("ERROR: invalid configuration for demodulation parameters\n");
+            MSG_ERR("invalid configuration for demodulation parameters\n");
             return -1;
         }
     }
@@ -1414,7 +1387,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
         snprintf(param_name, sizeof param_name, "chan_multiSF_%i", i); /* compose parameter path inside JSON structure */
         val = json_object_get_value(conf_obj, param_name); /* fetch value (if possible) */
         if (json_value_get_type(val) != JSONObject) {
-            MSG("INFO: no configuration for Lora multi-SF channel %i\n", i);
+            MSG_INFO("no configuration for Lora multi-SF channel %i\n", i);
             continue;
         }
         /* there is an object to configure that Lora multi-SF channel, let's parse it */
@@ -1426,7 +1399,7 @@ static int parse_SX130x_configuration(const char * conf_file) {
             ifconf.enable = false;
         }
         if (ifconf.enable == false) { /* Lora multi-SF channel disabled, nothing else to parse */
-            MSG("INFO: Lora multi-SF channel %i disabled\n", i);
+            MSG_INFO("Lora multi-SF channel %i disabled\n", i);
         } else  { /* Lora multi-SF channel enabled, will parse the other parameters */
             snprintf(param_name, sizeof param_name, "chan_multiSF_%i.radio", i);
             ifconf.rf_chain = (uint32_t)json_object_dotget_number(conf_obj, param_name);
@@ -1435,11 +1408,11 @@ static int parse_SX130x_configuration(const char * conf_file) {
             if_info[i].radio = ifconf.rf_chain;
             if_info[i].freq_if = ifconf.freq_hz;
             // TODO: handle individual SF enabling and disabling (spread_factor)
-            MSG("INFO: Lora multi-SF channel %i>  radio %i, IF %i Hz, 125 kHz bw, SF 5 to 12\n", i, ifconf.rf_chain, ifconf.freq_hz);
+            MSG_INFO("Lora multi-SF channel %i>  radio %i, IF %i Hz, 125 kHz bw, SF 5 to 12\n", i, ifconf.rf_chain, ifconf.freq_hz);
         }
         /* all parameters parsed, submitting configuration to the HAL */
         if (lgw_rxif_setconf(i, &ifconf) != LGW_HAL_SUCCESS) {
-            MSG("ERROR: invalid configuration for Lora multi-SF channel %i\n", i);
+            MSG_ERR("invalid configuration for Lora multi-SF channel %i\n", i);
             return -1;
         }
     }
@@ -1460,17 +1433,17 @@ static int parse_gateway_configuration(const char * conf_file) {
     /* try to parse JSON */
     root_val = json_parse_file_with_comments(conf_file);
     if (root_val == NULL) {
-        MSG("ERROR: %s is not a valid JSON file\n", conf_file);
+        MSG_ERR("%s is not a valid JSON file\n", conf_file);
         exit(EXIT_FAILURE);
     }
 
     /* point to the gateway configuration object */
     conf_obj = json_object_get_object(json_value_get_object(root_val), conf_obj_name);
     if (conf_obj == NULL) {
-        MSG("INFO: %s does not contain a JSON object named %s\n", conf_file, conf_obj_name);
+        MSG_INFO("%s does not contain a JSON object named %s\n", conf_file, conf_obj_name);
         return -1;
     } else {
-        MSG("INFO: %s does contain a JSON object named %s, parsing gateway parameters\n", conf_file, conf_obj_name);
+        MSG_INFO("%s does contain a JSON object named %s, parsing gateway parameters\n", conf_file, conf_obj_name);
     }
 
     /* gateway unique identifier (aka MAC address) (optional) */
@@ -1478,14 +1451,21 @@ static int parse_gateway_configuration(const char * conf_file) {
     if (str != NULL) {
         sscanf(str, "%llx", &ull);
         lgwm = ull;
-        MSG("INFO: gateway MAC address is configured to %016llX\n", ull);
+        MSG_INFO("gateway MAC address is configured to %016llX\n", ull);
     }
 
-    /* get interval (in seconds) for statistics display (optional) */
-    val = json_object_get_value(conf_obj, "stat_interval");
+    /* get interval (in seconds) for uploading reports (optional) */
+    val = json_object_get_value(conf_obj, "report_interval");
     if (val != NULL) {
-        stat_interval = (unsigned)json_value_get_number(val);
-        MSG("INFO: statistics display interval is configured to %u seconds\n", stat_interval);
+        report_interval = (unsigned)json_value_get_number(val);
+        MSG_INFO("report uploading interval is configured to %u seconds\n", report_interval);
+    }
+
+    /* get interval (in seconds) for changing log files (optional) */
+    val = json_object_get_value(conf_obj, "log_interval");
+    if (val != NULL) {
+        log_interval = (unsigned)json_value_get_number(val);
+        MSG_INFO("statistics display interval is configured to %u seconds\n", log_interval);
     }
 
     /* GPS module TTY path (optional) */
@@ -1493,24 +1473,24 @@ static int parse_gateway_configuration(const char * conf_file) {
     if (str != NULL) {
         strncpy(gps_tty_path, str, sizeof gps_tty_path);
         gps_tty_path[sizeof gps_tty_path - 1] = '\0'; /* ensure string termination */
-        MSG("INFO: GPS serial port path is configured to \"%s\"\n", gps_tty_path);
+        MSG_INFO("GPS serial port path is configured to \"%s\"\n", gps_tty_path);
     }
 
     /* get reference coordinates */
     val = json_object_get_value(conf_obj, "ref_latitude");
     if (val != NULL) {
         reference_coord.lat = (double)json_value_get_number(val);
-        MSG("INFO: Reference latitude is configured to %f deg\n", reference_coord.lat);
+        MSG_INFO("Reference latitude is configured to %f deg\n", reference_coord.lat);
     }
     val = json_object_get_value(conf_obj, "ref_longitude");
     if (val != NULL) {
         reference_coord.lon = (double)json_value_get_number(val);
-        MSG("INFO: Reference longitude is configured to %f deg\n", reference_coord.lon);
+        MSG_INFO("Reference longitude is configured to %f deg\n", reference_coord.lon);
     }
     val = json_object_get_value(conf_obj, "ref_altitude");
     if (val != NULL) {
         reference_coord.alt = (short)json_value_get_number(val);
-        MSG("INFO: Reference altitude is configured to %i meters\n", reference_coord.alt);
+        MSG_INFO("Reference altitude is configured to %i meters\n", reference_coord.alt);
     }
 
     /* Gateway GPS coordinates hardcoding (aka. faking) option */
@@ -1518,9 +1498,9 @@ static int parse_gateway_configuration(const char * conf_file) {
     if (json_value_get_type(val) == JSONBoolean) {
         gps_fake_enable = (bool)json_value_get_boolean(val);
         if (gps_fake_enable == true) {
-            MSG("INFO: fake GPS is enabled\n");
+            MSG_INFO("fake GPS is enabled\n");
         } else {
-            MSG("INFO: fake GPS is disabled\n");
+            MSG_INFO("fake GPS is disabled\n");
         }
     }
 
@@ -1544,25 +1524,25 @@ static int parse_debug_configuration(const char * conf_file) {
     /* try to parse JSON */
     root_val = json_parse_file_with_comments(conf_file);
     if (root_val == NULL) {
-        MSG("ERROR: %s is not a valid JSON file\n", conf_file);
+        MSG_ERR("%s is not a valid JSON file\n", conf_file);
         exit(EXIT_FAILURE);
     }
 
     /* point to the gateway configuration object */
     conf_obj = json_object_get_object(json_value_get_object(root_val), conf_obj_name);
     if (conf_obj == NULL) {
-        MSG("INFO: %s does not contain a JSON object named %s\n", conf_file, conf_obj_name);
+        MSG_INFO("%s does not contain a JSON object named %s\n", conf_file, conf_obj_name);
         json_value_free(root_val);
         return -1;
     } else {
-        MSG("INFO: %s does contain a JSON object named %s, parsing debug parameters\n", conf_file, conf_obj_name);
+        MSG_INFO("%s does contain a JSON object named %s, parsing debug parameters\n", conf_file, conf_obj_name);
     }
 
     /* Get reference payload configuration */
     conf_array = json_object_get_array (conf_obj, "ref_payload");
     if (conf_array != NULL) {
         debugconf.nb_ref_payload = json_array_get_count(conf_array);
-        MSG("INFO: got %u debug reference payload\n", debugconf.nb_ref_payload);
+        MSG_INFO("got %u debug reference payload\n", debugconf.nb_ref_payload);
 
         for (i = 0; i < (int)debugconf.nb_ref_payload; i++) {
             conf_obj_array = json_array_get_object(conf_array, i);
@@ -1570,7 +1550,7 @@ static int parse_debug_configuration(const char * conf_file) {
             str = json_object_get_string(conf_obj_array, "id");
             if (str != NULL) {
                 sscanf(str, "0x%08X", &(debugconf.ref_payload[i].id));
-                MSG("INFO: reference payload ID %d is 0x%08X\n", i, debugconf.ref_payload[i].id);
+                MSG_INFO("reference payload ID %d is 0x%08X\n", i, debugconf.ref_payload[i].id);
             }
 
             /* global count */
@@ -1583,12 +1563,12 @@ static int parse_debug_configuration(const char * conf_file) {
     if (str != NULL) {
         strncpy(debugconf.log_file_name, str, sizeof debugconf.log_file_name);
         debugconf.log_file_name[sizeof debugconf.log_file_name - 1] = '\0'; /* ensure string termination */
-        MSG("INFO: setting debug log file name to %s\n", debugconf.log_file_name);
+        MSG_INFO("setting debug log file name to %s\n", debugconf.log_file_name);
     }
 
     /* Commit configuration */
     if (lgw_debug_setconf(&debugconf) != LGW_HAL_SUCCESS) {
-        MSG("ERROR: Failed to configure debug\n");
+        MSG_ERR("Failed to configure debug\n");
         json_value_free(root_val);
         return -1;
     }
@@ -1598,38 +1578,39 @@ static int parse_debug_configuration(const char * conf_file) {
     return 0;
 }
 
-void log_open (void) {
-    int i;
-    char iso_date[20];
+static void log_open (void) {
 
-    strftime(iso_date,ARRAY_SIZE(iso_date),"%Y%m%dT%H%M%SZ",gmtime(&now_time)); /* format yyyymmddThhmmssZ */
-    log_start_time = now_time; /* keep track of when the log was started, for log rotation */
+    struct timespec now_utc_time;
+    char iso_date[40];
+    
+    clock_gettime(CLOCK_REALTIME, &now_utc_time);
+    strftime(iso_date, ARRAY_SIZE(iso_date),"%Y%m%dT%H%M%SZ", gmtime(&now_utc_time.tv_sec)); /* format yyyymmddThhmmssZ */
 
     sprintf(log_file_name, "sniffer_log_%s.txt", iso_date);
     log_file = fopen(log_file_name, "a"); /* create log file, append if file already exist */
     if (log_file == NULL) {
-        MSG("ERROR: impossible to create log file %s\n", log_file_name);
+        MSG_ERR("impossible to create log file %s\n", log_file_name);
         exit(EXIT_FAILURE);
     }
 
-    i = fprintf(log_file, "\"gateway ID\",\"node MAC\",\"UTC timestamp\",\"us count\",\"frequency\",\"RF chain\",\"RX chain\",\"status\",\"size\",\"modulation\",\"bandwidth\",\"datarate\",\"coderate\",\"RSSI\",\"SNR\",\"payload\"\n");
-    if (i < 0) {
-        MSG("ERROR: impossible to write to log file %s\n", log_file_name);
-        exit(EXIT_FAILURE);
-    }
+    // i = fprintf(log_file, "\"gateway ID\",\"node MAC\",\"UTC timestamp\",\"us count\",\"frequency\",\"RF chain\",\"RX chain\",\"status\",\"size\",\"modulation\",\"bandwidth\",\"datarate\",\"coderate\",\"RSSI\",\"SNR\",\"payload\"\n");
+    // if (i < 0) {
+    //     MSG_ERR("impossible to write to log file %s\n", log_file_name);
+    //     exit(EXIT_FAILURE);
+    // }
 
-    MSG("INFO: Now writing to log file %s\n", log_file_name);
+    MSG_INFO("Now writing to log file %s\n", log_file_name);
     return;
 }
 
-void log_close (void) {
+static void log_close (void) {
 
     int i;
 
     i = fclose(log_file);
 
     if (i < 0) {
-        MSG("ERROR: Failed to close log file\n");
+        MSG_ERR("Failed to close log file\n");
         exit(EXIT_FAILURE);
     }
 }
@@ -1653,7 +1634,6 @@ void thread_listen(void) {
     /* struct for placing data into encoding queue */
     struct entry *pkt_encode;
 
-    printf("\n\n");
     while (!exit_sig && !quit_sig) {
 
         /* fetch packets */
@@ -1662,7 +1642,7 @@ void thread_listen(void) {
         pthread_mutex_unlock(&mx_concent);
         
         if (nb_pkt == LGW_HAL_ERROR) {
-            MSG("ERROR: failed packet fetch, exiting\n");
+            MSG_ERR("failed packet fetch, exiting\n");
             exit(EXIT_FAILURE);
         } else if (nb_pkt == 0) {
             clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
@@ -1678,8 +1658,8 @@ void thread_listen(void) {
         }
     }
 
-    printf("%ld Packets heard!\n", pkt_in_log);
-    MSG("\nINFO: End of listening thread\n");
+    MSG_INFO("Packets caught: %ld\n", pkt_in_log);
+    MSG_INFO("End of listening thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1758,7 +1738,7 @@ void thread_encode(void) {
     }
 
     destroy_ed_report(report);
-    MSG("\nINFO: End of encoding thread\n");
+    MSG_INFO("End of encoding thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1768,15 +1748,17 @@ void thread_upload(void) {
     create_ch_report();
 
     while (!exit_sig && !quit_sig) {
-        wait_ms(1000 * stat_interval);
+        wait_ms(1000 * report_interval);
 
-        /* Acquire channel locks */
+        /* Acquire channel and log locks */
         pthread_mutex_lock(&mx_report_ch);
+        pthread_mutex_lock(&mx_log);
         
         /* Generate all reports for channels */
         create_all_channel_reports();
 
-        /* Generate gateway statistic report */
+        /* Generate gateway statistic report and write to log */
+
 
         /* Upload reports */
 
@@ -1791,12 +1773,12 @@ void thread_upload(void) {
         ed_reports = 0;
         ch_reports = 0;
         
-
+        pthread_mutex_unlock(&mx_log);
         pthread_mutex_unlock(&mx_report_ch);
     }
 
     destroy_ch_report();
-    MSG("\nINFO: End of uploading thread\n");
+    MSG_INFO("End of uploading thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1809,7 +1791,7 @@ static void gps_process_sync(void) {
 
     /* get GPS time for synchronization */
     if (i != LGW_GPS_SUCCESS) {
-        //MSG("WARNING: [gps] could not get GPS time from GPS\n");
+        //MSG_WARN("[gps] could not get GPS time from GPS\n");
         return;
     }
 
@@ -1818,7 +1800,7 @@ static void gps_process_sync(void) {
     i = lgw_get_trigcnt(&trig_tstamp);
     pthread_mutex_unlock(&mx_concent);
     if (i != LGW_HAL_SUCCESS) {
-        MSG("WARNING: [gps] failed to read concentrator timestamp\n");
+        MSG_WARN("[gps] failed to read concentrator timestamp\n");
         return;
     }
 
@@ -1827,7 +1809,7 @@ static void gps_process_sync(void) {
     i = lgw_gps_sync(&time_reference_gps, trig_tstamp, utc, gps_time);
     pthread_mutex_unlock(&mx_timeref);
     if (i != LGW_GPS_SUCCESS) {
-        MSG("WARNING: [gps] GPS out of sync, keeping previous time reference\n");
+        MSG_WARN("[gps] GPS out of sync, keeping previous time reference\n");
     }
 }
 
@@ -1868,7 +1850,7 @@ void thread_gps(void) {
         /* blocking non-canonical read on serial port */
         ssize_t nb_char = read(gps_tty_fd, serial_buff + wr_idx, LGW_GPS_MIN_MSG_SIZE);
         if (nb_char <= 0) {
-            MSG("WARNING: [gps] read() returned value %zd\n", nb_char);
+            MSG_WARN("[gps] read() returned value %zd\n", nb_char);
             continue;
         }
         wr_idx += (size_t)nb_char;
@@ -1894,7 +1876,7 @@ void thread_gps(void) {
                         frame_size = 0;
                     } else if (latest_msg == INVALID) {
                         /* message header received but message appears to be corrupted */
-                        MSG("WARNING: [gps] could not get a valid message from GPS (no time)\n");
+                        MSG_WARN("[gps] could not get a valid message from GPS (no time)\n");
                         frame_size = 0;
                     } else if (latest_msg == UBX_NAV_TIMEGPS) {
                         gps_process_sync();
@@ -1943,7 +1925,7 @@ void thread_gps(void) {
             wr_idx -= LGW_GPS_MIN_MSG_SIZE;
         }
     }
-    MSG("\nINFO: End of GPS thread\n");
+    MSG_INFO("End of GPS thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1960,18 +1942,6 @@ void thread_valid(void) {
     double init_acc = 0.0;
     double x;
 
-    /* correction debug */
-    // FILE * log_file = NULL;
-    // time_t now_time;
-    // char log_name[64];
-
-    /* initialization */
-    // time(&now_time);
-    // strftime(log_name,sizeof log_name,"xtal_err_%Y%m%dT%H%M%SZ.csv",localtime(&now_time));
-    // log_file = fopen(log_name, "w");
-    // setbuf(log_file, NULL);
-    // fprintf(log_file,"\"xtal_correct\",\"XERR_INIT_AVG %u XERR_FILT_COEF %u\"\n", XERR_INIT_AVG, XERR_FILT_COEF); // DEBUG
-
     /* main loop task */
     while (!exit_sig && !quit_sig) {
         wait_ms(1000);
@@ -1984,7 +1954,6 @@ void thread_valid(void) {
             gps_ref_valid = true;
             ref_valid_local = true;
             xtal_err_cpy = time_reference_gps.xtal_err;
-            //printf("XTAL err: %.15lf (1/XTAL_err:%.15lf)\n", xtal_err_cpy, 1/xtal_err_cpy); // DEBUG
         } else {
             /* time ref is too old, invalidate */
             gps_ref_valid = false;
@@ -2010,24 +1979,19 @@ void thread_valid(void) {
                 /* initial average calculation */
                 pthread_mutex_lock(&mx_xcorr);
                 xtal_correct = (double)(XERR_INIT_AVG) / init_acc;
-                //printf("XERR_INIT_AVG=%d, init_acc=%.15lf\n", XERR_INIT_AVG, init_acc);
                 xtal_correct_ok = true;
                 pthread_mutex_unlock(&mx_xcorr);
                 ++init_cpt;
-                // fprintf(log_file,"%.18lf,\"average\"\n", xtal_correct); // DEBUG
             } else {
                 /* tracking with low-pass filter */
                 x = 1 / xtal_err_cpy;
                 pthread_mutex_lock(&mx_xcorr);
                 xtal_correct = xtal_correct - xtal_correct/XERR_FILT_COEF + x/XERR_FILT_COEF;
                 pthread_mutex_unlock(&mx_xcorr);
-                // fprintf(log_file,"%.18lf,\"track\"\n", xtal_correct); // DEBUG
             }
         }
-
-        //printf("Time ref: %s, XTAL correct: %s (%.15lf)\n", ref_valid_local?"valid":"invalid", xtal_correct_ok?"valid":"invalid", xtal_correct); // DEBUG
     }
-    MSG("\nINFO: End of validation thread\n");
+    MSG_INFO("End of validation thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2167,7 +2131,6 @@ int main(int argc, char **argv) {
         {
         case 'v':
         verbose =  true;
-        printf("Its verbosin' time!\n");
         break;
 
         case 'h':
@@ -2186,19 +2149,22 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* opening log file */
     log_open();
 
-    print_log("this is a test of sorts\n");
+    // log_open();
 
-    print_log("this is a test with %d numbers!%d\n", 2, 1);
+    // MSG_ERR("this is a test of sorts\n");
 
-    log_close();
+    // MSG_WARN("this is a test with %d numbers!%d\n", 2, 1);
 
-    return EXIT_SUCCESS;
+    // log_close();
+
+    // return EXIT_SUCCESS;
 
     /* configuration files management */
     if (access(conf_fname, R_OK) == 0) { /* if there is a global conf, parse it  */
-        MSG("INFO: found configuration file %s, parsing it\n", conf_fname);
+        MSG_INFO("found configuration file %s, parsing it\n", conf_fname);
         i = parse_SX130x_configuration(conf_fname);
         if (i != 0) {
             exit(EXIT_FAILURE);
@@ -2209,10 +2175,10 @@ int main(int argc, char **argv) {
         }
         i = parse_debug_configuration(conf_fname);
         if (i != 0) {
-            MSG("INFO: no debug configuration\n");
+            MSG_INFO("no debug configuration\n");
         }
     } else {
-        MSG("ERROR: [main] failed to find any configuration file named %s\n", conf_fname);
+        MSG_ERR("[main] failed to find any configuration file named %s\n", conf_fname);
         exit(EXIT_FAILURE);
     }
 
@@ -2220,11 +2186,11 @@ int main(int argc, char **argv) {
     if (gps_tty_path[0] != '\0') { /* do not try to open GPS device if no path set */
         i = lgw_gps_enable(gps_tty_path, "ubx7", 0, &gps_tty_fd); /* HAL only supports u-blox 7 for now */
         if (i != LGW_GPS_SUCCESS) {
-            printf("WARNING: [main] impossible to open %s for GPS sync (check permissions)\n", gps_tty_path);
+            MSG_WARN("impossible to open %s for GPS sync (check permissions)\n", gps_tty_path);
             gps_enabled = false;
             gps_ref_valid = false;
         } else {
-            printf("INFO: [main] TTY port %s open for GPS synchronization\n", gps_tty_path);
+            MSG_INFO("TTY port %s open for GPS synchronization\n", gps_tty_path);
             gps_enabled = true;
             gps_ref_valid = false;
         }
@@ -2234,27 +2200,24 @@ int main(int argc, char **argv) {
     if (start_sniffer())
         exit(EXIT_FAILURE);
 
-    /* opening log file and writing CSV header*/
-    //time(&now_time);
-
     /* channel and gateway info encoding and uploading thread */
     i = pthread_create(&thrid_upload, NULL, (void * (*)(void *))thread_upload, NULL);
     if (i != 0) {
-        MSG("ERROR: [main] impossible to create uploading thread\n");
+        MSG_ERR("[main] impossible to create uploading thread\n");
         exit(EXIT_FAILURE);
     }
 
     /* end device encoding thread */
     i = pthread_create(&thrid_encode, NULL, (void * (*)(void *))thread_encode, NULL);
     if (i != 0) {
-        MSG("ERROR: [main] impossible to create encoding thread\n");
+        MSG_ERR("[main] impossible to create encoding thread\n");
         exit(EXIT_FAILURE);
     }
 
     /* main listener for upstream */
     i = pthread_create(&thrid_listen, NULL, (void * (*)(void *))thread_listen, NULL);
     if (i != 0) {
-        MSG("ERROR: [main] impossible to create listening thread\n");
+        MSG_ERR("[main] impossible to create listening thread\n");
         exit(EXIT_FAILURE);
     }
 
@@ -2262,7 +2225,7 @@ int main(int argc, char **argv) {
     if (spectral_scan_params.enable == true) {
         i = pthread_create(&thrid_spectral, NULL, (void * (*)(void *))thread_spectral_scan, NULL);
         if (i != 0) {
-            MSG("ERROR: [main] impossible to create Spectral Scan thread\n");
+            MSG_ERR("[main] impossible to create Spectral Scan thread\n");
             exit(EXIT_FAILURE);
         }
     }
@@ -2271,12 +2234,12 @@ int main(int argc, char **argv) {
     if (gps_enabled == true) {
         i = pthread_create(&thrid_gps, NULL, (void * (*)(void *))thread_gps, NULL);
         if (i != 0) {
-            MSG("ERROR: [main] impossible to create GPS thread\n");
+            MSG_ERR("[main] impossible to create GPS thread\n");
             exit(EXIT_FAILURE);
         }
         i = pthread_create(&thrid_valid, NULL, (void * (*)(void *))thread_valid, NULL);
         if (i != 0) {
-            MSG("ERROR: [main] impossible to create validation thread\n");
+            MSG_ERR("[main] impossible to create validation thread\n");
             exit(EXIT_FAILURE);
         }
     }
@@ -2291,56 +2254,40 @@ int main(int argc, char **argv) {
 
     while (!exit_sig && !quit_sig) {
         // Sleep, then report once time is up
-        wait_ms(1000 * stat_interval);
-        pthread_mutex_lock(&mx_concent);
+        wait_ms(1000 * log_interval);
+        pthread_mutex_lock(&mx_log);
 
-        // TODO Rearrange the order, make the sniffer stop -> report -> swap radios if needed -> restart sniffer
-
-        if (radio_group_swapping) {
-            if (stop_sniffer())
-                exit(EXIT_FAILURE);
-
-            // Create all the channel reports
-
-            // Create any gateway reports
-
-            // Upload all of the channel, gateway, and device reports
-
-            radio_group_current++;
-            radio_group_current %= radio_group_count;
-
-            init_radio_group(radio_group_current);
-
-            if (start_sniffer())
-                exit(EXIT_FAILURE);
+        /* close current log and open a new one only if no interrupt signals have been given */
+        if (!exit_sig && !quit_sig) {
+            log_close();
+            log_open();
         }
         
-        pthread_mutex_unlock(&mx_concent);
-    }
-
-    /* Wait for ED encoding thread to end */
-    i = pthread_detach(thrid_encode);
-    // i = pthread_join(thrid_encode, NULL);
-    if (i != 0) {
-        printf("ERROR: failed to join ED encoding upstream thread with %d - %s\n", i, strerror(errno));
-    }
-
-    /* Wait for uploading thread to end */
-    i = pthread_join(thrid_upload, NULL);
-    if (i != 0) {
-        printf("ERROR: failed to join uploading upstream thread with %d - %s\n", i, strerror(errno));
+        pthread_mutex_unlock(&mx_log);
     }
 
     /* Get all of our main concentrator listening threads to close */
     i = pthread_join(thrid_listen, NULL);
     if (i != 0) {
-        printf("ERROR: failed to join LoRa listening upstream thread with %d - %s\n", i, strerror(errno));
+        MSG_ERR("Failed to join LoRa listening upstream thread with %d - %s\n", i, strerror(errno));
+    }
+
+    /* Wait for ED encoding thread to end */
+    i = pthread_join(thrid_encode, NULL);
+    if (i != 0) {
+        MSG_ERR("Failed to join ED encoding upstream thread with %d - %s\n", i, strerror(errno));
+    }
+
+    /* Wait for uploading thread to end */
+    i = pthread_join(thrid_upload, NULL);
+    if (i != 0) {
+        MSG_ERR("Failed to join uploading upstream thread with %d - %s\n", i, strerror(errno));
     }
 
     if (spectral_scan_params.enable == true) {
         i = pthread_join(thrid_spectral, NULL);
         if (i != 0) {
-            printf("ERROR: failed to join Spectral Scan thread with %d - %s\n", i, strerror(errno));
+            MSG_ERR("Failed to join Spectral Scan thread with %d - %s\n", i, strerror(errno));
         }
     }
 
@@ -2350,9 +2297,9 @@ int main(int argc, char **argv) {
 
         i = lgw_gps_disable(gps_tty_fd);
         if (i == LGW_HAL_SUCCESS) {
-            MSG("INFO: GPS closed successfully\n");
+            MSG_INFO("GPS closed successfully\n");
         } else {
-            MSG("WARNING: failed to close GPS successfully\n");
+            MSG_WARN("failed to close GPS successfully\n");
         }
     }
 
@@ -2362,34 +2309,14 @@ int main(int argc, char **argv) {
         stat_cleanup();
     }
 
-    // create_all_channel_reports();
-
-    // printf("\n\n");
-    // ch_info_t *ch_info;
-
-    // for (i = 0; i < LGW_MULTI_NB; i++) {
-    //     for (j = 0; j < SF_COUNT; j++) {
-    //         if (ch_report_info[i][j].device_count) {
-    //             ch_info = &ch_report_info[i][j];
-    //             printf("Activity found on channel %.1fHz @ SF: %d\n", ch_info->freq, ch_info->sf);
-
-    //             printf("Recieved messages from the following devices:\n");
-
-    //             for(uint32_t g = 0; g < ch_info->device_count; g++) {
-    //                 printf("%x, ", ch_info->devices[g].device_adr);
-    //             }
-    //             printf("\n");
-    //             printf("Message total: %d (unique: %d, failed: %d)\n", ch_info->msg_total, ch_info->msg_unique, ch_info->msg_failed);
-    //             printf("\n");
-    //         }
-    //     }
-    // }
-    // printf("\n\n");
-
     /* message queue deinitialisation */
     STAILQ_INIT(&head);
 
-    MSG("INFO: Exiting packet sniffer program\n");
+    MSG_INFO("Exiting packet sniffer program\n");
+
+    /* close the log file */
+    log_close();
+
     return EXIT_SUCCESS;
 }
 

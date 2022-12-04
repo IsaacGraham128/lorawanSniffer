@@ -69,7 +69,9 @@
     "gateway_conf": {
         "gateway_ID": "001",
         /* Reporting interval (in seconds) */
-        "stat_interval": 10,
+        "report_interval": 10,
+        /* Log generation (in seconds) */
+        "log_interval": 15,
         /* GPS configuration */
         "gps_tty_path": "/dev/ttyS0",
         /* GPS reference coordinates */
