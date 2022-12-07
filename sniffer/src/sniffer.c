@@ -737,7 +737,7 @@ static void create_gw_report (void) {
 
     /* Acquire ram utilisation values */
     file = fopen(FILE_RAM_INFO,"r");
-    getline(&line, &len, file);                 /* get the total system ram*/
+    getline(&line, &len, file);                 /* get the total system ram */
     ram_total = get_ram_value(line) / 1024;     /* convert to mibi bytes */
     getline(&line, &len, file);                 /* skip this line, we dont care about free */   
     getline(&line, &len, file);                 /* get the available system ram */   
