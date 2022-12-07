@@ -83,6 +83,8 @@ Maintainer: Sylvain Miermont
 
 #define JSON_CONF_DEFAULT   "conf.json"
 
+#define RAM_INFO_FILE       "/proc/meminfo"
+
 #define JSON_REPORT_SUFFIX  ".json"
 
 #define JSON_FILE_ED        "ed_data_"
@@ -115,10 +117,9 @@ Maintainer: Sylvain Miermont
 
 /* JSON key fields for gateway report information */
 #define JSON_TMP_CPU        "temp_cpu"
-#define JSON_TMP_CEL        "temp_cel"
 #define JSON_TMP_CON        "temp_con"
 #define JSON_RAM_TOTL       "ram_totl"
-#define JSON_RAM_FREE       "ram_free"  
+#define JSON_RAM_AVAL       "ram_aval"  
 // what other fields could I get?
 // rssi for the cell chip?
 // 
@@ -132,6 +133,10 @@ Maintainer: Sylvain Miermont
 #define GPS_REF_MAX_AGE     30          /* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
 #define XERR_INIT_AVG       16          /* nb of measurements the XTAL correction is averaged on as initial value */
 #define XERR_FILT_COEF      256         /* coefficient for low-pass XTAL error tracking */
+
+#define MS_CONV             1000        /* conversion define to go from seconds to milliseconds*/
+#define UPLOAD_SLEEP        1           /* sleep time of the upload thread to check if its time to upload */
+#define GPS_SLEEP           1           /* sleep time of the GPS thread */
 #define DEFAULT_INT_REPORT  900         /* default time interval (seconds) for report uploading */
 #define DEFAULT_INT_LOG     1800        /* default time interval (seconds) for log usage */
 
@@ -487,6 +492,8 @@ float get_cpu_temp (void) {
     num = line;
     value = (float)strtol(num, &num, 10) / 1000.0;
 
+    fclose(stream);
+
     return value;
 }
 
@@ -705,18 +712,40 @@ static void encode_ch_report(ch_report_t *info, int index) {
 */
 static void create_gw_report (void) {
 
-    JSON_Value* root_value;
-    JSON_Object* root_object;
-    FILE* file;
-    char* serialized_string = NULL;
-    char* timestamp = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
-
-    /* Variables for utilisation and statistics  */
-    float temp_cpu, temp_cel, temp_con;
-    float ram_free, ram_used;
     struct timespec fetch_time;
     struct tm *xt;
+    JSON_Value *root_value;
+    JSON_Object *root_object;
+    FILE* file;
+    size_t len;
+    char *serialized_string = NULL;
+    char *line;
+    char *timestamp = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
 
+    /* Variables for utilisation and statistics */
+    int i;
+    float temp_cpu, temp_con;
+    uint16_t ram_total, ram_available;
+    
+    temp_cpu = 0;
+    //temp_cpu = get_cpu_temp();
+    i = lgw_get_temperature(&temp_con);
+
+    if (i == LGW_HAL_ERROR) {
+        MSG_ERR("Failed to acquire concentrator temp\n");
+        temp_con = 0;
+    }
+
+    /* Acquire ram utilisation values */
+    file = fopen(RAM_INFO_FILE,"r");
+    getline(&line, &len, file);                 /* get the total system ram*/
+    ram_total = get_ram_value(line) / 1024;     /* convert to mibi bytes */
+    getline(&line, &len, file);                 /* skip this line, we dont care about free */   
+    getline(&line, &len, file);                 /* get the available system ram */   
+    ram_available = get_ram_value(line) / 1024; /* convert to mibi bytes */
+    fclose(file);
+
+    /* Now continue log information as usual */
     clock_gettime(CLOCK_REALTIME, &fetch_time);
     xt = gmtime(&(fetch_time.tv_sec));
     sprintf(timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
@@ -730,10 +759,9 @@ static void create_gw_report (void) {
     json_object_set_string(root_object, JSON_TIME,      timestamp);
     json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_GW);
     json_object_set_number(root_object, JSON_TMP_CPU,   temp_cpu);
-    json_object_set_number(root_object, JSON_TMP_CEL,   temp_cel);
     json_object_set_number(root_object, JSON_TMP_CON,   temp_con);
-    json_object_set_number(root_object, JSON_RAM_TOTL,  ram_used);
-    json_object_set_number(root_object, JSON_RAM_FREE,  ram_free);
+    json_object_set_number(root_object, JSON_RAM_TOTL,  ram_total);
+    json_object_set_number(root_object, JSON_RAM_AVAL,  ram_available);
     
     serialized_string = json_serialize_to_string(root_value);
     fputs(serialized_string, file);
@@ -1006,9 +1034,10 @@ static void stat_cleanup(void) {
     int i;
 
     /* cleanup radio configuration */
-    for (i = 0; i < radio_group_count; i++)
+    for (i = 0; i < radio_group_count; i++) {
         free(rfconf[i]);
-
+    }
+        
     free(rfconf);
 }
 
@@ -1704,6 +1733,8 @@ void thread_encode(void) {
 
         while (pkt_encode != NULL) {
 
+            MSG_INFO("[encoder] Got a packet time to encode!\n");
+
             /* Clear data in report object*/
             reset_ed_report(report);
 
@@ -1721,6 +1752,8 @@ void thread_encode(void) {
             /* Write to report and encode t device json */
             write_ed_report(report, &pkt_encode->rx_pkt, xt, &pkt_utc_time);
             encode_ed_report(report, ed_reports++);
+
+            //MSG_INFO("Report number %d encoded for this time frame\n", ed_reports);
 
             /* Update the appropriate channel aggregate info */
             write_ch_report(report, &pkt_encode->rx_pkt);
@@ -1745,36 +1778,50 @@ void thread_encode(void) {
 /* --- THREAD 1.11: Channel aggregate encoding and uploading JSONs ---------- */
 void thread_upload(void) {
 
+    time_t start, current;
+
+    /* Create the channel report to be used */ 
     create_ch_report();
 
+    start = time(NULL);
+
     while (!exit_sig && !quit_sig) {
-        wait_ms(1000 * report_interval);
 
-        /* Acquire channel and log locks */
-        pthread_mutex_lock(&mx_report_ch);
-        pthread_mutex_lock(&mx_log);
-        
-        /* Generate all reports for channels */
-        create_all_channel_reports();
+        wait_ms(MS_CONV * UPLOAD_SLEEP);
+        current = time(NULL);
 
-        /* Generate gateway statistic report and write to log */
+        /* check if upload interval time has elapsed */
+        if (difftime(current, start) > report_interval) {
+            MSG_INFO("[upload] creating logs before uploading\n");
+            /* Acquire channel and log locks */
+            pthread_mutex_lock(&mx_report_ch);
+            pthread_mutex_lock(&mx_log);
+            
+            /* Generate all reports for channels */
+            create_all_channel_reports();
+
+            /* Generate gateway statistic report and write to log */
+            create_gw_report();
 
 
-        /* Upload reports */
+            /* Upload reports */
 
-        /* Delete reports */
+            /* Delete reports */
 
-        /* Log data to file */
-        ed_reports_total += ed_reports;
-        ch_reports_total += ch_reports;
+            /* Log data to file */
+            ed_reports_total += ed_reports;
+            ch_reports_total += ch_reports;
 
-        /* Cleanup of any data structures to prep for next upload */
-        reset_ch_report();
-        ed_reports = 0;
-        ch_reports = 0;
-        
-        pthread_mutex_unlock(&mx_log);
-        pthread_mutex_unlock(&mx_report_ch);
+            /* Cleanup of any data structures to prep for next upload */
+            reset_ch_report();
+            ed_reports = 0;
+            ch_reports = 0;
+            
+            pthread_mutex_unlock(&mx_log);
+            pthread_mutex_unlock(&mx_report_ch);
+
+            start = time(NULL);
+        }
     }
 
     destroy_ch_report();
@@ -1791,7 +1838,7 @@ static void gps_process_sync(void) {
 
     /* get GPS time for synchronization */
     if (i != LGW_GPS_SUCCESS) {
-        //MSG_WARN("[gps] could not get GPS time from GPS\n");
+        MSG_WARN("[gps] could not get GPS time from GPS\n");
         return;
     }
 
@@ -1835,7 +1882,11 @@ static void gps_process_coords(void) {
 void thread_gps(void) {
     /* serial variables */
     char serial_buff[128]; /* buffer to receive GPS data */
+    ssize_t nb_char;
     size_t wr_idx = 0;     /* pointer to end of chars in buffer */
+    size_t rd_idx;
+    size_t frame_end_idx;
+    size_t frame_size;
 
     /* variables for PPM pulse GPS synchronization */
     enum gps_msg latest_msg; /* keep track of latest NMEA message parsed */
@@ -1844,11 +1895,12 @@ void thread_gps(void) {
     memset(serial_buff, 0, sizeof serial_buff);
 
     while (!exit_sig && !quit_sig) {
-        size_t rd_idx = 0;
-        size_t frame_end_idx = 0;
+        
+        rd_idx = 0;
+        frame_end_idx = 0;
 
         /* blocking non-canonical read on serial port */
-        ssize_t nb_char = read(gps_tty_fd, serial_buff + wr_idx, LGW_GPS_MIN_MSG_SIZE);
+        nb_char = read(gps_tty_fd, serial_buff + wr_idx, LGW_GPS_MIN_MSG_SIZE);
         if (nb_char <= 0) {
             MSG_WARN("[gps] read() returned value %zd\n", nb_char);
             continue;
@@ -1860,7 +1912,7 @@ void thread_gps(void) {
          * attempt to decode frame if one is found *
          *******************************************/
         while (rd_idx < wr_idx) {
-            size_t frame_size = 0;
+            frame_size = 0;
 
             /* Scan buffer for UBX sync char */
             if (serial_buff[rd_idx] == (char)LGW_GPS_UBX_SYNC_CHAR) {
@@ -2253,8 +2305,8 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sigact, NULL); /* default "kill" command */
 
     while (!exit_sig && !quit_sig) {
-        // Sleep, then report once time is up
-        wait_ms(1000 * log_interval);
+        /* Sleep, then create new log once time is up */
+        wait_ms(MS_CONV * log_interval);
         pthread_mutex_lock(&mx_log);
 
         /* close current log and open a new one only if no interrupt signals have been given */
