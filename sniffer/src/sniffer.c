@@ -76,14 +76,12 @@ Maintainer: Sylvain Miermont
     #define VERSION_STRING "undefined"
 #endif
 
-#define OPTION_ARGS         "vhc:"
-
-#define FILE_CPU_TEMP       "/proc/meminfo"
-#define FILE_RAM_INFO       "/sys/class/thermal/thermal_zone0/temp"
+#define OPTION_ARGS         "achv:"
 
 #define JSON_CONF_DEFAULT   "conf.json"
 
-#define RAM_INFO_FILE       "/proc/meminfo"
+#define FILE_CPU_TEMP       "/sys/class/thermal/thermal_zone0/temp"
+#define FILE_RAM_INFO       "/proc/meminfo"
 
 #define JSON_REPORT_SUFFIX  ".json"
 
@@ -120,16 +118,14 @@ Maintainer: Sylvain Miermont
 #define JSON_TMP_CON        "temp_con"
 #define JSON_RAM_TOTL       "ram_totl"
 #define JSON_RAM_AVAL       "ram_aval"  
-// what other fields could I get?
-// rssi for the cell chip?
-// 
-// also need to make a log file
 
 #define JSON_TIME_LEN       80          /* Max length of the timestamp string, including null terminator */
 #define JSON_DEVADDR_LEN    9           /* Max length of the device address string, including null terminator */
 #define JSON_MTYPE_LEN      4           /* Max length of the message type string, including null terminator */
 #define JSON_CRC_LEN        6           /* Max length of the CRC string, including null terminator */
 
+#define GPS_MAX_NO_SYNC     1000        /* maximum limit to failed sync attempts before reseting */
+#define GPS_SYNC_SILENCE    10          /* interval for number of failures before GPS logs failure message */
 #define GPS_REF_MAX_AGE     30          /* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
 #define XERR_INIT_AVG       16          /* nb of measurements the XTAL correction is averaged on as initial value */
 #define XERR_FILT_COEF      256         /* coefficient for low-pass XTAL error tracking */
@@ -157,8 +153,8 @@ Maintainer: Sylvain Miermont
 #define EXTRA_PHDR          8           /* Bytes allocated to LoRa transmission PHDR and PHDR_CRC */
 #define EXTRA_CRC           2           /* Bytes allocated to LoRa transmission CRC */
 
-#define INFO_ARRAY_DEFAULT  1          /* Initial space allocation for listening to devices */
-#define INFO_ARRAY_SCALER   2          /* Used for realloc increase factor */
+#define INFO_ARRAY_DEFAULT  3          /* Initial space allocation for listening to devices */
+#define INFO_ARRAY_SCALER   1.67        /* Used for realloc increase factor */
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE TYPES -------------------------------------------------------- */
 
@@ -257,6 +253,7 @@ static uint64_t lgwm = 0; /* LoRa gateway MAC address */
 /* clock and log file management */
 static pthread_mutex_t mx_log = PTHREAD_MUTEX_INITIALIZER; /* control access to the log file */
 static bool verbose = false;
+static bool continuous = false;
 static FILE * log_file = NULL;
 static char log_file_name[128];
 
@@ -285,8 +282,10 @@ static bool gps_fake_enable; /* enable the feature */
 
 static pthread_mutex_t mx_meas_gps = PTHREAD_MUTEX_INITIALIZER; /* control access to the GPS statistics */
 static bool gps_coord_valid; /* could we get valid GPS coordinates ? */
-static struct coord_s meas_gps_coord; /* GPS position of the gateway */
-static struct coord_s meas_gps_err; /* GPS position of the gateway */
+static struct coord_s meas_gps_coord;   /* GPS position of the gateway */
+static struct coord_s meas_gps_err;     /* GPS position of the gateway */
+static uint32_t gps_sync_fail = 0;      /* used to help silence the GPS and reset everything */
+static uint8_t gps_speak_cnt = 0;      /* used to help silence the GPS and reset everything */
 
 /* Gateway specificities */
 static int8_t antenna_gain = 0;
@@ -410,7 +409,6 @@ static void log_open (void);
 
 static void log_close (void);
 
-
 /* Auxiliary GPS thread functions */
 
 static void gps_process_sync(void);
@@ -481,10 +479,11 @@ float get_ram_value(char* str) {
 */
 float get_cpu_temp (void) {
 
-    FILE* stream;
-    char *line, *num;
+    FILE *stream;
+    char *line = NULL;
+    char *num;
     size_t len;
-    float value = 0;
+    float value;
 
     stream = fopen(FILE_CPU_TEMP, "r");
 
@@ -728,7 +727,7 @@ static void create_gw_report (void) {
     uint16_t ram_total, ram_available;
     
     temp_cpu = 0;
-    //temp_cpu = get_cpu_temp();
+    temp_cpu = get_cpu_temp();
     i = lgw_get_temperature(&temp_con);
 
     if (i == LGW_HAL_ERROR) {
@@ -737,13 +736,16 @@ static void create_gw_report (void) {
     }
 
     /* Acquire ram utilisation values */
-    file = fopen(RAM_INFO_FILE,"r");
+    file = fopen(FILE_RAM_INFO,"r");
     getline(&line, &len, file);                 /* get the total system ram*/
     ram_total = get_ram_value(line) / 1024;     /* convert to mibi bytes */
     getline(&line, &len, file);                 /* skip this line, we dont care about free */   
     getline(&line, &len, file);                 /* get the available system ram */   
     ram_available = get_ram_value(line) / 1024; /* convert to mibi bytes */
     fclose(file);
+
+    MSG_INFO("Total RAM: %dMiB\n", ram_total);
+    MSG_INFO("Available RAM %dMiB\n", ram_available);
 
     /* Now continue log information as usual */
     clock_gettime(CLOCK_REALTIME, &fetch_time);
@@ -1683,6 +1685,7 @@ void thread_listen(void) {
                 pkt_encode->rx_pkt = rxpkt[i];
                 STAILQ_INSERT_TAIL(&head, pkt_encode, entries);
             }
+            pkt_in_log += nb_pkt;
             pthread_mutex_unlock(&mx_report_dev);
         }
     }
@@ -1763,6 +1766,8 @@ void thread_encode(void) {
             STAILQ_REMOVE(&head, pkt_encode, entry, entries);
             free((void*)pkt_encode);
             pkt_encode = pkt_next;
+
+            MSG_INFO("[encoder] packet was encoded\n");
         }
         pthread_mutex_unlock(&mx_report_ch);
         pthread_mutex_unlock(&mx_report_dev);
@@ -1814,8 +1819,15 @@ void thread_upload(void) {
 
             /* Cleanup of any data structures to prep for next upload */
             reset_ch_report();
-            ed_reports = 0;
-            ch_reports = 0;
+            if (!continuous) {
+                ed_reports = 0;
+                ch_reports = 0;
+            }
+
+            MSG_INFO("[uploader] ED reports encoded this period: %d\n", ed_reports);
+            MSG_INFO("[uploader] ED reports encoded total: %d\n", ed_reports_total);
+            MSG_INFO("[uploader] CH reports encoded this period: %d\n", ch_reports);
+            MSG_INFO("[uploader] CH reports encoded total: %d\n", ch_reports_total);
             
             pthread_mutex_unlock(&mx_log);
             pthread_mutex_unlock(&mx_report_ch);
@@ -1823,6 +1835,9 @@ void thread_upload(void) {
             start = time(NULL);
         }
     }
+
+    MSG_INFO("[uploader] ED reports encoded total: %d\n", ed_reports_total);
+    MSG_INFO("[uploader] CH reports encoded total: %d\n", ch_reports_total);
 
     destroy_ch_report();
     MSG_INFO("End of uploading thread\n");
@@ -1838,7 +1853,14 @@ static void gps_process_sync(void) {
 
     /* get GPS time for synchronization */
     if (i != LGW_GPS_SUCCESS) {
-        MSG_WARN("[gps] could not get GPS time from GPS\n");
+        pthread_mutex_lock(&mx_meas_gps);
+        gps_sync_fail++;
+        gps_speak_cnt++;
+        if (gps_speak_cnt == GPS_SYNC_SILENCE) {
+            gps_speak_cnt = 0;
+            MSG_WARN("[gps] could not get GPS time from GPS\n");
+        }
+        pthread_mutex_unlock(&mx_meas_gps);
         return;
     }
 
@@ -1857,6 +1879,7 @@ static void gps_process_sync(void) {
     pthread_mutex_unlock(&mx_timeref);
     if (i != LGW_GPS_SUCCESS) {
         MSG_WARN("[gps] GPS out of sync, keeping previous time reference\n");
+        return;
     }
 }
 
@@ -1996,7 +2019,6 @@ void thread_valid(void) {
 
     /* main loop task */
     while (!exit_sig && !quit_sig) {
-        wait_ms(1000);
 
         /* calculate when the time reference was last updated */
         pthread_mutex_lock(&mx_timeref);
@@ -2181,17 +2203,22 @@ int main(int argc, char **argv) {
     {
         switch( i )
         {
-        case 'v':
-        verbose =  true;
-        break;
+        case 'a':
+            printf("Keep all logs...\n");
+            continuous = true;
+            break;
+
+        case 'c':
+            conf_fname = optarg;
+            break;
 
         case 'h':
             usage( );
             return EXIT_SUCCESS;
             break;
 
-        case 'c':
-            conf_fname = optarg;
+        case 'v':
+            verbose =  true;
             break;
 
         default:
@@ -2203,16 +2230,6 @@ int main(int argc, char **argv) {
 
     /* opening log file */
     log_open();
-
-    // log_open();
-
-    // MSG_ERR("this is a test of sorts\n");
-
-    // MSG_WARN("this is a test with %d numbers!%d\n", 2, 1);
-
-    // log_close();
-
-    // return EXIT_SUCCESS;
 
     /* configuration files management */
     if (access(conf_fname, R_OK) == 0) { /* if there is a global conf, parse it  */
@@ -2313,6 +2330,13 @@ int main(int argc, char **argv) {
         if (!exit_sig && !quit_sig) {
             log_close();
             log_open();
+
+            pthread_mutex_lock(&mx_meas_gps);
+            if (gps_sync_fail == GPS_MAX_NO_SYNC) {
+                MSG_WARN("[main] time to reset the GPS\n");
+            }
+            pthread_mutex_unlock(&mx_meas_gps);
+            
         }
         
         pthread_mutex_unlock(&mx_log);

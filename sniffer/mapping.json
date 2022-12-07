@@ -16,7 +16,7 @@
       "type": "half_float"
     },
     "ToA": {
-      "type": "half_float"
+      "type": "Half_float"
     },
     "ADR": {
       "type": "boolean"
@@ -57,19 +57,16 @@
     "MsgFailed": {
       "type": "short"
     },
-    "tm_cpu": {
-      "type": "half_float"
-    },
-    "tmp_cel": {
+    "tmp_cpu": {
       "type": "half_float"
     },
     "tmp_con": {
       "type": "half_float"
     },
-    "ram_tot": {
+    "ram_totl": {
       "type": "short"
     },
-    "ram_free": {
+    "ram_aval": {
       "type": "short"
     }
   }
