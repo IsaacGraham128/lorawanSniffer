@@ -12,6 +12,28 @@
 *.obj
 *.elf
 
+# Private files
+sniffer/client_key.json
+sniffer/@auth.json
+
+# Me testing files
+sniffer/src/json_test.c
+
+# Mapping files
+sniffer/mapping.json
+
+# Output or logging files
+*.log
+sniffer/device*.json
+sniffer/channel*.json
+sniffer/gateway*.json
+
+# Text files
+*.txt
+
+# Vscode related files
+.vscode
+
 # Linker output
 *.ilk
 *.map

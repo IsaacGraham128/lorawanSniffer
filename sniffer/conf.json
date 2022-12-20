@@ -7,7 +7,7 @@
         "antenna_gain": 0, /* antenna gain, in dBi */
         "full_duplex": false,
         "fine_timestamp": {
-            "enable": true,
+            "enable": false,
             "mode": "all_sf" /* high_capacity or all_sf */
         },
         "sx1261_conf": {
@@ -67,9 +67,11 @@
     },
 
     "gateway_conf": {
-        "gateway_ID": "AA555A0000000000",
+        "gateway_ID": "001",
         /* Reporting interval (in seconds) */
-        "stat_interval": 10,
+        "report_interval": 1800,
+        /* Log generation (in seconds) */  
+        "log_interval": 3600,
         /* GPS configuration */
         "gps_tty_path": "/dev/ttyS0",
         /* GPS reference coordinates */
@@ -83,7 +85,6 @@
         "ref_payload":[
             {"id": "0xCAFE1234"},
             {"id": "0xCAFE2345"}
-        ],
-        "log_file": "sniffer.log"
+        ]
     }
 }
