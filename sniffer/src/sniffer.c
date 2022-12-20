@@ -31,7 +31,7 @@ Maintainer: Sylvain Miermont
 #include <string.h>     /* memset */
 #include <signal.h>     /* sigaction */
 #include <time.h>       /* time clock_gettime strftime gmtime clock_nanosleep*/
-#include <unistd.h>     /* getopt access */
+#include <unistd.h>     /* getopt access fork */
 #include <stdlib.h>     /* atoi, malloc */
 #include <errno.h>      /* error messages */
 #include <math.h>       /* round */
@@ -76,7 +76,7 @@ Maintainer: Sylvain Miermont
     #define VERSION_STRING "undefined"
 #endif
 
-#define OPTION_ARGS         "achv:"
+#define OPTION_ARGS         "acdhv:"
 
 #define JSON_CONF_DEFAULT   "conf.json"
 
@@ -314,7 +314,7 @@ static spectral_scan_t spectral_scan_params = {
 
 /* JSON writing management */
 ch_info_t ch_report_info[LGW_MULTI_NB][SF_COUNT];
-static char report_string[50];
+static char report_string[75];
 static int ed_reports = 0;
 static int ch_reports = 0;
 
@@ -430,8 +430,11 @@ static void usage( void )
     printf("~~~ Library version string~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
     printf(" %s\n", lgw_version_info());
     printf("~~~ Available options ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
-    printf(" -h  print this help\n");
+    printf(" -a keep all logs\n");
     printf(" -c <filename>  use config file other than 'conf.json'\n");
+    printf(" -d create process as daemon\n");
+    printf(" -h print this help\n");
+    printf(" -v print all log messages to stdout\n");
     printf("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~\n");
 }
 
@@ -440,9 +443,13 @@ static void usage( void )
  */ 
 static void sig_handler(int sigio) {
     if (sigio == SIGQUIT) {
+        MSG_INFO("SIGQUIT Recieved\n");
         quit_sig = true;
     } else if ((sigio == SIGINT) || (sigio == SIGTERM)) {
+        MSG_INFO("SIGINT/TERM Recieved\n");
         exit_sig = true;
+    } else {
+        MSG_INFO("Unknown signal given\n");
     }
     return;
 }
@@ -507,7 +514,7 @@ float get_cpu_temp (void) {
 static void create_file_string(char* file_type, int index) {
 
     char number[20];
-    memset(report_string, 0, 50);
+    memset(report_string, 0, 75);
     sprintf(number, "%d", index);
     strcat(report_string, file_type);
     strcat(report_string, number);
@@ -728,7 +735,12 @@ static void create_gw_report (void) {
     
     temp_cpu = 0;
     temp_cpu = get_cpu_temp();
+
+    temp_con = 0;
+
+    pthread_mutex_lock(&mx_concent);
     i = lgw_get_temperature(&temp_con);
+    pthread_mutex_unlock(&mx_concent);
 
     if (i == LGW_HAL_ERROR) {
         MSG_ERR("Failed to acquire concentrator temp\n");
@@ -744,6 +756,8 @@ static void create_gw_report (void) {
     ram_available = get_ram_value(line) / 1024; /* convert to mibi bytes */
     fclose(file);
 
+    MSG_INFO("Pi Temp: %fC\n", temp_cpu);
+    MSG_INFO("LGW Temp: %fC\n", temp_con);
     MSG_INFO("Total RAM: %dMiB\n", ram_total);
     MSG_INFO("Available RAM %dMiB\n", ram_available);
 
@@ -996,9 +1010,11 @@ static uint8_t find_channel_no(uint32_t freq) {
  * @return  -1 on failure, otherwise 0
  */
 static int start_sniffer(void) {
+
     int i;
 
     i = lgw_start();
+
     if (i == LGW_HAL_SUCCESS) {
         MSG_INFO("concentrator started, packet can now be received\n");
     } else {
@@ -1017,7 +1033,9 @@ static int start_sniffer(void) {
 static int stop_sniffer(void) {
 
     int i;
+
     i = lgw_stop();
+
     if (i == LGW_HAL_SUCCESS) {
         MSG_INFO("concentrator stopped successfully\n");
     } else {
@@ -1624,12 +1642,6 @@ static void log_open (void) {
         exit(EXIT_FAILURE);
     }
 
-    // i = fprintf(log_file, "\"gateway ID\",\"node MAC\",\"UTC timestamp\",\"us count\",\"frequency\",\"RF chain\",\"RX chain\",\"status\",\"size\",\"modulation\",\"bandwidth\",\"datarate\",\"coderate\",\"RSSI\",\"SNR\",\"payload\"\n");
-    // if (i < 0) {
-    //     MSG_ERR("impossible to write to log file %s\n", log_file_name);
-    //     exit(EXIT_FAILURE);
-    // }
-
     MSG_INFO("Now writing to log file %s\n", log_file_name);
     return;
 }
@@ -1736,7 +1748,7 @@ void thread_encode(void) {
 
         while (pkt_encode != NULL) {
 
-            MSG_INFO("[encoder] Got a packet time to encode!\n");
+            MSG_INFO("[encoder] Packet recieved, encoding\n");
 
             /* Clear data in report object*/
             reset_ed_report(report);
@@ -1745,6 +1757,7 @@ void thread_encode(void) {
             if (gps_ok) {
                 i = lgw_cnt2utc(local_ref, pkt_encode->rx_pkt.count_us, &pkt_utc_time);
                 if (i != LGW_GPS_SUCCESS) {
+                    MSG_ERR("[encoder] Failed to get GPS time conversion\n");
                     clock_gettime(CLOCK_REALTIME, &pkt_utc_time);
                 }
             } else {
@@ -1756,8 +1769,6 @@ void thread_encode(void) {
             write_ed_report(report, &pkt_encode->rx_pkt, xt, &pkt_utc_time);
             encode_ed_report(report, ed_reports++);
 
-            //MSG_INFO("Report number %d encoded for this time frame\n", ed_reports);
-
             /* Update the appropriate channel aggregate info */
             write_ch_report(report, &pkt_encode->rx_pkt);
 
@@ -1766,8 +1777,6 @@ void thread_encode(void) {
             STAILQ_REMOVE(&head, pkt_encode, entry, entries);
             free((void*)pkt_encode);
             pkt_encode = pkt_next;
-
-            MSG_INFO("[encoder] packet was encoded\n");
         }
         pthread_mutex_unlock(&mx_report_ch);
         pthread_mutex_unlock(&mx_report_dev);
@@ -1783,7 +1792,11 @@ void thread_encode(void) {
 /* --- THREAD 1.11: Channel aggregate encoding and uploading JSONs ---------- */
 void thread_upload(void) {
 
+    /* Time management variables to ensure thread activates at the correct time*/
     time_t start, current;
+
+    /* Dummy return variable */
+    int i, j;
 
     /* Create the channel report to be used */ 
     create_ch_report();
@@ -1797,7 +1810,7 @@ void thread_upload(void) {
 
         /* check if upload interval time has elapsed */
         if (difftime(current, start) > report_interval) {
-            MSG_INFO("[upload] creating logs before uploading\n");
+            MSG_INFO("[upload] Creating logs before uploading\n");
             /* Acquire channel and log locks */
             pthread_mutex_lock(&mx_report_ch);
             pthread_mutex_lock(&mx_log);
@@ -1806,29 +1819,43 @@ void thread_upload(void) {
             create_all_channel_reports();
 
             /* Generate gateway statistic report and write to log */
-            create_gw_report();
-
+            create_gw_report(); // TODO: Change this to just acquiring logs?
 
             /* Upload reports */
+            
 
             /* Delete reports */
+            /* Delete ch reports */
+            for (i = 0; i < ch_reports; i++) {
+                create_file_string(JSON_REPORT_CH, i);
+                j = remove(report_string);
+                if (j) {
+                    MSG_ERR("[uploader] Failed to remove file %s\n", report_string);
+                }
+            }
+
+            /* Delete ed reports */
+            for (i = 0; i < ed_reports; i++) {
+                create_file_string(JSON_REPORT_ED, i);
+                j = remove(report_string);
+                if (j) {
+                    MSG_ERR("[uploader] Failed to remove file %s\n", report_string);
+                }
+            }
 
             /* Log data to file */
-            ed_reports_total += ed_reports;
-            ch_reports_total += ch_reports;
+            MSG_INFO("[uploader] ED reports encoded this period: %d\n", ed_reports);
+            MSG_INFO("[uploader] CH reports encoded this period: %d\n", ch_reports);
 
             /* Cleanup of any data structures to prep for next upload */
             reset_ch_report();
             if (!continuous) {
                 ed_reports = 0;
                 ch_reports = 0;
+                ed_reports_total += ed_reports;
+                ch_reports_total += ch_reports;
             }
 
-            MSG_INFO("[uploader] ED reports encoded this period: %d\n", ed_reports);
-            MSG_INFO("[uploader] ED reports encoded total: %d\n", ed_reports_total);
-            MSG_INFO("[uploader] CH reports encoded this period: %d\n", ch_reports);
-            MSG_INFO("[uploader] CH reports encoded total: %d\n", ch_reports_total);
-            
             pthread_mutex_unlock(&mx_log);
             pthread_mutex_unlock(&mx_report_ch);
 
@@ -1958,6 +1985,7 @@ void thread_gps(void) {
                     }
                 }
             } else if (serial_buff[rd_idx] == (char)LGW_GPS_NMEA_SYNC_CHAR) {
+
                 /************************
                  * Found NMEA sync char *
                  ************************/
@@ -1971,6 +1999,7 @@ void thread_gps(void) {
 
                     if(latest_msg == INVALID || latest_msg == UNKNOWN) {
                         /* checksum failed */
+                        MSG_WARN("[gps] Failed checksum validation\n");
                         frame_size = 0;
                     } else if (latest_msg == NMEA_RMC) { /* Get location from RMC frames */
                         gps_process_coords();
@@ -2185,6 +2214,10 @@ int main(int argc, char **argv) {
     const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
     const char * conf_fname = defaut_conf_fname; /* pointer to a string we won't touch */
 
+    /* deamonise handling variables */
+    pid_t pid;
+    bool daemonise = false;
+
     /* threads */
     pthread_t thrid_listen;
     pthread_t thrid_encode;
@@ -2196,20 +2229,23 @@ int main(int argc, char **argv) {
     /* message queue initialisation */
     STAILQ_INIT(&head);
 
-    
-
     /* parse command line options */
     while( (i = getopt( argc, argv, OPTION_ARGS )) != -1 )
     {
         switch( i )
         {
         case 'a':
-            printf("Keep all logs...\n");
+            printf("INFO: Keeping all logs...\n");
             continuous = true;
             break;
 
         case 'c':
             conf_fname = optarg;
+            break;
+
+        case 'd':
+            printf("INFO: Creating as daemon...\n");
+            daemonise = true;
             break;
 
         case 'h':
@@ -2222,10 +2258,22 @@ int main(int argc, char **argv) {
             break;
 
         default:
-            printf( "ERROR: argument parsing options, use -h option for help\n" );
+            printf("ERROR: argument parsing options, use -h option for help\n" );
             usage( );
             return EXIT_FAILURE;
         }
+    }
+
+    if (daemonise) {
+        pid = fork();
+        if (pid < 0) {
+            printf("ERROR: Failed to daemonise\n");
+            exit(EXIT_FAILURE); /* unable to daemonise */
+        }
+        if (pid > 0) {
+            exit(EXIT_SUCCESS); /* parent termination */
+        }
+        printf("INFO: daemon created successfully\n");
     }
 
     /* opening log file */
