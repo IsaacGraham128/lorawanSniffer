@@ -13,8 +13,9 @@
 *.elf
 
 # Private files
-sniffer/client_key.json
-sniffer/@auth.json
+sniffer/client*.json
+sniffer/auth.json
+sniffer/out.json
 
 # Me testing files
 sniffer/src/json_test.c

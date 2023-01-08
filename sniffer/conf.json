@@ -68,10 +68,10 @@
 
     "gateway_conf": {
         "gateway_ID": "001",
-        /* Reporting interval (in seconds) */
-        "report_interval": 1800,
-        /* Log generation (in seconds) */  
-        "log_interval": 3600,
+        /* Reporting interval (in seconds) - currently 5 minutes */
+        "report_interval": 300,
+        /* Log generation (in seconds) - currently a day */  
+        "log_interval": 86400,
         /* GPS configuration */
         "gps_tty_path": "/dev/ttyS0",
         /* GPS reference coordinates */
@@ -86,5 +86,14 @@
             {"id": "0xCAFE1234"},
             {"id": "0xCAFE2345"}
         ]
+    },
+
+    "upload_conf": {
+        /* Auth0 client key json */
+        "client_key": "client_key.json",
+        /* Auth0 domain url */
+        "client_domain": "https://sdl-api.au.auth0.com/oauth/token",
+        /* dashboard endpoint url */
+        "dashboard_url": "https://socialdiscoverylab.com/API/sniffer/isaac_house"
     }
 }

@@ -60,6 +60,8 @@ Maintainer: Sylvain Miermont
 
 /* Logging macro function */
 #define print_log(format, ...) {                                                                    \
+    int i = 0;                                                                                      \
+    log_file = fopen(log_file_name, "a");                                                           \
     time_t ltime = time(NULL);                                                                      \
     char *time_str = ctime(&ltime);                                                                 \
     time_str[strlen(time_str)-1] = '\0';                                                            \
@@ -67,6 +69,11 @@ Maintainer: Sylvain Miermont
         fprintf(stdout, format __VA_OPT__(,) __VA_ARGS__);                                          \
     }                                                                                               \
     fprintf(log_file, "%s - " format , time_str __VA_OPT__(,) __VA_ARGS__);                         \
+    i = fclose(log_file);                                                                           \
+    if (i < 0) {                                                                                    \
+        printf("Failed to close log file\n");                                                       \
+        sniffer_exit();                                                                             \
+    }                                                                                               \
 }                                                                                                   \
 
 /* -------------------------------------------------------------------------- */
@@ -76,7 +83,7 @@ Maintainer: Sylvain Miermont
     #define VERSION_STRING "undefined"
 #endif
 
-#define OPTION_ARGS         "acdhv:"
+#define OPTION_ARGS         ":acdhv"
 
 #define JSON_CONF_DEFAULT   "conf.json"
 
@@ -153,8 +160,16 @@ Maintainer: Sylvain Miermont
 #define EXTRA_PHDR          8           /* Bytes allocated to LoRa transmission PHDR and PHDR_CRC */
 #define EXTRA_CRC           2           /* Bytes allocated to LoRa transmission CRC */
 
-#define INFO_ARRAY_DEFAULT  3          /* Initial space allocation for listening to devices */
+#define INFO_ARRAY_DEFAULT  3           /* Initial space allocation for listening to devices */
 #define INFO_ARRAY_SCALER   1.67        /* Used for realloc increase factor */
+
+/* defines for AUTH0 and HTTP POST curl-ing */
+#define CURL_MIN_FAILS      3
+#define CURL_MAX_FAILS      5
+#define CURL_OUTPUT         "out.json"
+#define CURL_PREFIX         "curl --connect-timeout 15 -o out.json -s -H \"Content-Type: application/json\""
+#define CURL_TEST           "curl --connect-timeout 15 -s"
+
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE TYPES -------------------------------------------------------- */
 
@@ -257,9 +272,17 @@ static bool continuous = false;
 static FILE * log_file = NULL;
 static char log_file_name[128];
 
+/* uploading files, auth0 authorisation and HTTP post variables */
+static uint8_t failed_curls = 0;
+static char file_client_key[80];   /* holds the client_key file string */
+static char url_auth0[80];         /* auth0 url for token collection */
+static char url_dash[80];          /* desired dashboard url */
+static char auth_key[800];         /* holds the bearer token string */
+
+
 /* hardware access control and correction */
 // TODOD : What happens if this is made static??
-pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
+static pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
 static pthread_mutex_t mx_xcorr = PTHREAD_MUTEX_INITIALIZER; /* control access to the XTAL correction */
 static bool xtal_correct_ok = false; /* set true when XTAL correction is stable enough */
 static double xtal_correct = 1.0;
@@ -386,9 +409,11 @@ static void create_all_channel_reports(void);
 
 static uint8_t find_channel_no(uint32_t freq);
 
-static int start_sniffer(void);
+static int sniffer_start(void);
 
-static int stop_sniffer(void);
+static int sniffer_stop(void);
+
+static void sniffer_exit(void);
 
 /* Radio configuration functions */
 
@@ -404,10 +429,23 @@ static int parse_gateway_configuration(const char * conf_file);
 
 static int parse_debug_configuration(const char * conf_file);
 
+static int parse_upload_configuration(const char * conf_file);
+
 /* Log file interaction */
 static void log_open (void);
 
 static void log_close (void);
+
+/* curl HTTP post handling functions */
+static int curl_handle_timeout (char* url_to_check);
+
+static int curl_check_output (char * curl_string);
+
+static void curl_check_output_auth0 (char * curl_string);
+
+static int curl_get_auth0 (void);
+
+static int curl_upload_file (const char * upload_file);
 
 /* Auxiliary GPS thread functions */
 
@@ -722,7 +760,7 @@ static void create_gw_report (void) {
     struct tm *xt;
     JSON_Value *root_value;
     JSON_Object *root_object;
-    FILE* file;
+    FILE* file = NULL;
     size_t len;
     char *serialized_string = NULL;
     char *line;
@@ -749,13 +787,19 @@ static void create_gw_report (void) {
 
     /* Acquire ram utilisation values */
     file = fopen(FILE_RAM_INFO,"r");
+
+    if (file == NULL) {
+        MSG_ERR("[main] Unable to open RAM info file\n");
+        sniffer_exit();
+    }
+
     getline(&line, &len, file);                 /* get the total system ram */
     ram_total = get_ram_value(line) / 1024;     /* convert to mibi bytes */
     getline(&line, &len, file);                 /* skip this line, we dont care about free */   
     getline(&line, &len, file);                 /* get the available system ram */   
     ram_available = get_ram_value(line) / 1024; /* convert to mibi bytes */
     fclose(file);
-
+    
     MSG_INFO("Pi Temp: %fC\n", temp_cpu);
     MSG_INFO("LGW Temp: %fC\n", temp_con);
     MSG_INFO("Total RAM: %dMiB\n", ram_total);
@@ -938,7 +982,7 @@ static void write_ch_report (ed_report_t* report, struct lgw_pkt_rx_s* p) {
                     ch_info->devices_tmp = (lora_device_t*)realloc(ch_info->devices, ch_info->list_len * sizeof(lora_device_t));
                     if (ch_info->devices_tmp == NULL) {
                         MSG_ERR("Realloc failed\n");
-                        exit(EXIT_FAILURE);
+                        sniffer_exit();
                     }
                     ch_info->devices = ch_info->devices_tmp;
                 }
@@ -1009,7 +1053,7 @@ static uint8_t find_channel_no(uint32_t freq) {
  * 
  * @return  -1 on failure, otherwise 0
  */
-static int start_sniffer(void) {
+static int sniffer_start(void) {
 
     int i;
 
@@ -1030,7 +1074,7 @@ static int start_sniffer(void) {
  * 
  * @return  -1 on failure, otherwise 0
  */
-static int stop_sniffer(void) {
+static int sniffer_stop(void) {
 
     int i;
 
@@ -1045,6 +1089,18 @@ static int stop_sniffer(void) {
 
     return 0;
 }
+
+/**
+ * Special exiting function. Turns of the gateway concentrator.
+ * 
+ * Is it needed? Idk, just nice I guess...
+*/
+static void sniffer_exit(void) {
+
+    sniffer_stop();
+    exit(EXIT_FAILURE);
+}
+
 
 /**
  * Cleanup function for allocated statistic memory.
@@ -1627,6 +1683,61 @@ static int parse_debug_configuration(const char * conf_file) {
     return 0;
 }
 
+static int parse_upload_configuration(const char * conf_file) {
+
+    const char conf_obj_name[] = "upload_conf";
+    JSON_Object *conf_obj = NULL;
+    JSON_Value *root_val = NULL;
+    const char *str; /* pointer to sub-strings in the JSON data */
+
+    root_val = json_parse_file_with_comments(conf_file);
+    if (root_val == NULL) {
+        MSG_ERR("%s is not a valid JSON file\n", conf_file);
+        exit(EXIT_FAILURE);
+    }
+
+    /* point to the gateway configuration object */
+    conf_obj = json_object_get_object(json_value_get_object(root_val), conf_obj_name);
+    if (conf_obj == NULL) {
+        MSG_INFO("%s does not contain a JSON object named %s\n", conf_file, conf_obj_name);
+        json_value_free(root_val);
+        return -1;
+    } else {
+        MSG_INFO("%s does contain a JSON object named %s, parsing debug parameters\n", conf_file, conf_obj_name);
+    }
+
+    /* Get auth0 log client key file */
+    str = json_object_get_string(conf_obj, "client_key");
+    if (str != NULL) {
+        strncpy(file_client_key, str, sizeof file_client_key);
+        file_client_key[sizeof file_client_key - 1] = '\0'; /* ensure string termination */
+        MSG_INFO("auth0 client key json file is %s\n", file_client_key);
+    }
+
+    /* Get auth0 domain url */
+    str = json_object_get_string(conf_obj, "client_domain");
+    if (str != NULL) {
+        strncpy(url_auth0, str, sizeof url_auth0);
+        url_auth0[sizeof url_auth0 - 1] = '\0'; /* ensure string termination */
+        MSG_INFO("auth0 url is %s\n", url_auth0);
+    }
+
+    /* Get dashboard endpoint URL */
+    str = json_object_get_string(conf_obj, "dashboard_url");
+    if (str != NULL) {
+        strncpy(url_dash, str, sizeof url_dash);
+        url_dash[sizeof url_dash - 1] = '\0'; /* ensure string termination */
+        MSG_INFO("dashboard endpoint url is %s\n", url_dash);
+    }
+    
+    json_value_free(root_val);
+    return 0;
+}
+
+/**
+ * Open new log file. This log file is written to by all "MSG_" logging functions,
+ * regardless of verbose status.
+*/
 static void log_open (void) {
 
     struct timespec now_utc_time;
@@ -1636,16 +1747,21 @@ static void log_open (void) {
     strftime(iso_date, ARRAY_SIZE(iso_date),"%Y%m%dT%H%M%SZ", gmtime(&now_utc_time.tv_sec)); /* format yyyymmddThhmmssZ */
 
     sprintf(log_file_name, "sniffer_log_%s.txt", iso_date);
-    log_file = fopen(log_file_name, "a"); /* create log file, append if file already exist */
+    log_file = fopen(log_file_name, "a"); /* create log file to check if its possible */
     if (log_file == NULL) {
-        MSG_ERR("impossible to create log file %s\n", log_file_name);
-        exit(EXIT_FAILURE);
+        printf("impossible to create log file %s\n", log_file_name);
+        sniffer_exit();
     }
+
+    fclose(log_file);
 
     MSG_INFO("Now writing to log file %s\n", log_file_name);
     return;
 }
 
+/**
+ * Close logging file.
+*/
 static void log_close (void) {
 
     int i;
@@ -1654,8 +1770,236 @@ static void log_close (void) {
 
     if (i < 0) {
         MSG_ERR("Failed to close log file\n");
-        exit(EXIT_FAILURE);
+        sniffer_exit();
     }
+}
+
+/**
+ * Checks for curl timeout, and now manages a failed counter. If the fail counter hits the minimum
+ * value (CURL_MIN_FAILS), the VPN tun0 will be closed and reopened. Should the fail counter exceed
+ * the maximum value (CURL_MAX_FAILS), the program will exit.
+ * 
+ * @param url_to_check  The url which the curl failed to reach
+ * @return              -1 if the curls fail, 0 if a connection was restablished
+*/
+static int curl_handle_timeout (char* url_to_check) {
+
+    int status, i;
+    char curl_string[120];
+
+    MSG_INFO("[uploader] Curl timeout occured after 15 seconds. Retrying connection to %s\n", url_to_check);
+
+    if (failed_curls == CURL_MIN_FAILS) {
+        status = system("sudo ifconfig tun0 down");
+
+        if (status) {
+            MSG_ERR("[uploader] Failed to close ifconfig tun0\n");
+            MSG_ERR("[uploader] Errno was %d\n", errno);
+            sniffer_exit();
+        }
+
+        status = system("sudo ifconfig tun0 up");
+
+        if (status) {
+            MSG_ERR("[uploader] Failed to reopen ifconfig tun0\n");
+            MSG_ERR("[uploader] Errno was %d\n", errno);
+            sniffer_exit();
+        }
+    } else if (failed_curls > CURL_MAX_FAILS) {
+        MSG_ERR("[uploader] Max number of curl reattempts failed. Exiting\n");
+        sniffer_exit();
+    }
+
+    /* Create our curl string to test */
+    sprintf(curl_string, "%s %s", CURL_TEST, url_to_check);
+
+    for (i = 0; i < 4; i++) {
+        MSG_INFO("[uploader] Curl reestablish attempt %d\n", i);
+
+        status = system((const char*)curl_string);
+
+        /* Check to see if the curl successfully returns */
+        if (!status) {
+            MSG_INFO("[uploader] Curl connection reestablished\n");
+            failed_curls = 0;
+            return 0;
+        }   
+    }
+
+    failed_curls++;
+
+    MSG_WARN("[uploader] Failed to reestablish curl connection\n");
+    MSG_WARN("[uploader] Failed curls now at %d\n", failed_curls);
+
+    return -1;
+}
+
+/**
+ * Check curl output of file upload.
+ * 
+ * If the file is empty, the curl was successful; if not investigate.
+ * 
+ * If response recieves unauthorized error, acquire new key, else exit.
+ * 
+ * @param curl_string   The curl string used to achieve the output. 
+ * 
+ * @return              -1 on timeout, 0 otherwise
+*/
+static int curl_check_output (char * curl_string) {
+
+    int i;
+    const char* str;
+    FILE* fp_out;
+    JSON_Value *root_val = NULL;
+
+    fp_out = fopen(CURL_OUTPUT, "r");
+    i = fgetc(fp_out);
+    fclose(fp_out);
+
+    if (i == EOF) {
+        /* File successfully uploaded */
+    } else {
+        /* JSON response not empty, need to investigate and handle */
+        root_val = json_parse_file(CURL_OUTPUT);
+
+        if (root_val == NULL) {
+            MSG_ERR("[uploader] Received curl response that was not a JSON response\n");
+            MSG_ERR("[uploader] Curl request string was %s\n", curl_string);
+            MSG_ERR("[uploader] Check %s for more details\n", CURL_OUTPUT);
+            sniffer_exit();
+        } else {
+            str = json_object_get_string(json_value_get_object(root_val), "message");
+
+            if (str == NULL || strncmp(str, "Unauthorized", 12)) {
+                MSG_ERR("[uploader] Unknown JSON curl response received.\n");
+                MSG_ERR("[uploader] Curl request string was %s\n", curl_string);
+                sniffer_exit();
+            } else {
+                MSG_INFO("[uploader] Received response {\"message\":\"Unauthorized\"}. Acquiring new key.\n");
+                i = curl_get_auth0();
+
+                if (i)
+                    return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
+/**
+ * Check curl auth0 request output.
+ * 
+ * Ideally check for access key, otherwise check for errors, output to log,
+ * and then exit.
+ * 
+ * @param curl_string   The curl string
+*/
+static void curl_check_output_auth0 (char * curl_string) {
+
+    const char* str;
+    JSON_Value *root_val = NULL;
+
+    root_val = json_parse_file(CURL_OUTPUT);
+
+    if (root_val == NULL) {
+        MSG_ERR("[uploader] Received curl response that was not a JSON response\n");
+        MSG_ERR("[uploader] Curl request string was %s\n", curl_string);
+        MSG_ERR("[uploader] Check %s for more details\n", CURL_OUTPUT);
+        sniffer_exit();
+    } else {
+        str = json_object_get_string(json_value_get_object(root_val), "error");
+
+        if (str == NULL) {
+            /* NULL string catch to prevent things breaking */
+        } else if (!strncmp(str, "access_denied", 13)) {
+            MSG_ERR("[uploader] Access denied. Check selected client secret json file.\n");
+            sniffer_exit();
+        }
+
+        str = json_object_get_string(json_value_get_object(root_val), "access_token");
+
+        if (str != NULL) {
+            /* we have found a bearer key, lets save it!!!!! */
+            memset(auth_key, 0, sizeof auth_key);
+            strcpy(auth_key, str);
+
+            MSG_INFO("[uploader] New AUTH key acquired\n");
+
+        } else {
+            MSG_ERR("[uploader] Unknown JSON curl response received.\n");
+            MSG_ERR("[uploader] Curl request string was %s\n", curl_string);;
+            sniffer_exit();
+        }
+    }
+}
+
+/**
+ * Complete auth0 request to acquirer bearer key for dashboard HTTP POST.
+*/
+static int curl_get_auth0 (void) {
+
+    int status;                 /* return variable */
+    char curl_string[1500];     /* holds the full curl string */
+    
+    sprintf(curl_string, "%s -d @%s %s", CURL_PREFIX, file_client_key, url_auth0);
+
+    status = system((const char*)curl_string);
+
+    if (!status) {
+        /* Successful curl, lets see the output */
+        curl_check_output_auth0(curl_string);
+    } else if (status == 7168) {
+        /* Timeout status has returned, lets handle it and explore what went wrong */
+        if (curl_handle_timeout(url_auth0)) {
+            return -1;
+        } else {
+            return 1;
+        }
+    } else {
+        /* Unknown error, we are leaving */
+        MSG_ERR("[uploader] During auth0 client request, System failed to run with exit code %d\n", status);
+        sniffer_exit();
+    }
+
+    return 0;
+}
+
+/**
+ * Curl POST upload end device and channel reports to dashboard.
+ * 
+ * Checks for a curl timeout and returns appropriately.
+ * 
+ * @param upload_file   File to upload.
+ * 
+ * @return              -1 on a curl failure, 0 on success, 1 if a curl connection is reestablished
+*/
+static int curl_upload_file (const char * upload_file) {
+
+    int status;                 /* return variable */
+    char curl_string[1500];     /* holds the full curl string */
+    
+    sprintf(curl_string, "%s -H \"Authorization: Bearer %s\" -d @%s %s", CURL_PREFIX, auth_key, upload_file, url_dash);
+
+    status = system((const char*)curl_string);
+
+    if (!status) {
+        /* Successful curl, lets see the output */
+        curl_check_output(curl_string);
+    } else if (status == 7168) {
+        /* Timeout status has returned, lets handle it and explore what went wrong */
+        if (curl_handle_timeout(url_dash)) {
+            return -1;
+        } else {
+            return 1;
+        }
+    } else {
+        /* Unknown error, we are dipping */
+        MSG_ERR("[uploader] During curl file upload, System failed to run with exit code %d\n", status);
+        sniffer_exit();
+    }
+
+    return 0;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1686,10 +2030,10 @@ void thread_listen(void) {
         
         if (nb_pkt == LGW_HAL_ERROR) {
             MSG_ERR("failed packet fetch, exiting\n");
-            exit(EXIT_FAILURE);
+            sniffer_exit();
         } else if (nb_pkt == 0) {
             clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
-            continue; // restart loop and check again
+            continue; // reestart loop and check again
         } else {
             pthread_mutex_lock(&mx_report_dev);
             for (i = 0; i < nb_pkt; ++i) {
@@ -1748,8 +2092,6 @@ void thread_encode(void) {
 
         while (pkt_encode != NULL) {
 
-            MSG_INFO("[encoder] Packet recieved, encoding\n");
-
             /* Clear data in report object*/
             reset_ed_report(report);
 
@@ -1768,6 +2110,8 @@ void thread_encode(void) {
             /* Write to report and encode t device json */
             write_ed_report(report, &pkt_encode->rx_pkt, xt, &pkt_utc_time);
             encode_ed_report(report, ed_reports++);
+
+            MSG_INFO("[encoder] Packet No.%d encoded this period\n", ed_reports);
 
             /* Update the appropriate channel aggregate info */
             write_ch_report(report, &pkt_encode->rx_pkt);
@@ -1796,7 +2140,10 @@ void thread_upload(void) {
     time_t start, current;
 
     /* Dummy return variable */
-    int i, j;
+    int success;
+
+    /* Handler variable for temporary outages */
+    int uploads = 0;
 
     /* Create the channel report to be used */ 
     create_ch_report();
@@ -1810,51 +2157,56 @@ void thread_upload(void) {
 
         /* check if upload interval time has elapsed */
         if (difftime(current, start) > report_interval) {
-            MSG_INFO("[upload] Creating logs before uploading\n");
+            MSG_INFO("[upload] Upload timer expired. Attempting upload...\n");
             /* Acquire channel and log locks */
             pthread_mutex_lock(&mx_report_ch);
             pthread_mutex_lock(&mx_log);
             
-            /* Generate all reports for channels */
-            create_all_channel_reports();
-
-            /* Generate gateway statistic report and write to log */
-            create_gw_report(); // TODO: Change this to just acquiring logs?
-
-            /* Upload reports */
-            
-
-            /* Delete reports */
-            /* Delete ch reports */
-            for (i = 0; i < ch_reports; i++) {
-                create_file_string(JSON_REPORT_CH, i);
-                j = remove(report_string);
-                if (j) {
-                    MSG_ERR("[uploader] Failed to remove file %s\n", report_string);
-                }
-            }
-
-            /* Delete ed reports */
-            for (i = 0; i < ed_reports; i++) {
+            /* Handle all ED reports generated */
+            for (int i = uploads; i < ed_reports; i++) {
                 create_file_string(JSON_REPORT_ED, i);
-                j = remove(report_string);
-                if (j) {
+
+                success = curl_upload_file(report_string);
+
+                /* Check if there was a special curl return, either a timeout or a connection reestablish*/
+                if (success == -1) {
+                    MSG_WARN("[uploader] Curl timeout occured. Waiting for next period.\n");
+                    break;
+                } else if (success == 1) {
+                    MSG_WARN("[uploader] Curl timeout fixed. Repeating upload attempt.\n");
+                    i--;
+                    continue;
+                }
+
+                /* Remove the file to save space */
+                success = remove(report_string);
+
+                if (success) {
                     MSG_ERR("[uploader] Failed to remove file %s\n", report_string);
                 }
+
+                /* Increment our upload counter */
+                uploads++;
             }
 
             /* Log data to file */
             MSG_INFO("[uploader] ED reports encoded this period: %d\n", ed_reports);
-            MSG_INFO("[uploader] CH reports encoded this period: %d\n", ch_reports);
+            MSG_INFO("[uploader] ED reports uploaded this period: %d\n", uploads);
 
-            /* Cleanup of any data structures to prep for next upload */
-            reset_ch_report();
-            if (!continuous) {
-                ed_reports = 0;
-                ch_reports = 0;
-                ed_reports_total += ed_reports;
-                ch_reports_total += ch_reports;
-            }
+            /* reset upload count if all end device reports were uploaded */
+            if (uploads == ed_reports) {
+
+                /* all data uploaded successfully, lets reset our variables */
+                uploads = 0;
+
+                if (!continuous) {
+                    ed_reports_total += ed_reports;
+                    ch_reports_total += ch_reports;
+                    ed_reports = 0;
+                    ch_reports = 0;
+                }
+
+            }      
 
             pthread_mutex_unlock(&mx_log);
             pthread_mutex_unlock(&mx_report_ch);
@@ -2279,20 +2631,35 @@ int main(int argc, char **argv) {
     /* opening log file */
     log_open();
 
+    /* check device can open shells with system function */
+    i = system(NULL);
+
+    if (i == 0) {
+        MSG_ERR("[main] Unable to open shell\n");
+        exit(EXIT_FAILURE);
+    }
+
     /* configuration files management */
     if (access(conf_fname, R_OK) == 0) { /* if there is a global conf, parse it  */
-        MSG_INFO("found configuration file %s, parsing it\n", conf_fname);
+        MSG_INFO("[main] found configuration file %s, parsing it\n", conf_fname);
         i = parse_SX130x_configuration(conf_fname);
         if (i != 0) {
+            MSG_ERR("[main] No \"SX130x_conf\" field in the chosen (or default) JSON\n");
             exit(EXIT_FAILURE);
         }
         i = parse_gateway_configuration(conf_fname);
         if (i != 0) {
+            MSG_ERR("[main] No \"gateway_conf\" field in the chosen (or default) JSON\n");
             exit(EXIT_FAILURE);
         }
         i = parse_debug_configuration(conf_fname);
         if (i != 0) {
-            MSG_INFO("no debug configuration\n");
+            MSG_INFO("[main] no debug configuration\n");
+        }
+        i =  parse_upload_configuration(conf_fname);
+        if (i != 0) {
+            MSG_ERR("[main] No \"upload_conf\" field in the chosen (or default) JSON\n");
+            exit(EXIT_FAILURE);
         }
     } else {
         MSG_ERR("[main] failed to find any configuration file named %s\n", conf_fname);
@@ -2314,28 +2681,30 @@ int main(int argc, char **argv) {
     }
 
     /* starting the concentrator */
-    if (start_sniffer())
+    if (sniffer_start()) {
+        MSG_ERR("[main] Failed to start sniffer\n");
         exit(EXIT_FAILURE);
+    }
 
     /* channel and gateway info encoding and uploading thread */
     i = pthread_create(&thrid_upload, NULL, (void * (*)(void *))thread_upload, NULL);
     if (i != 0) {
         MSG_ERR("[main] impossible to create uploading thread\n");
-        exit(EXIT_FAILURE);
+        sniffer_exit();
     }
 
     /* end device encoding thread */
     i = pthread_create(&thrid_encode, NULL, (void * (*)(void *))thread_encode, NULL);
     if (i != 0) {
         MSG_ERR("[main] impossible to create encoding thread\n");
-        exit(EXIT_FAILURE);
+        sniffer_exit();
     }
 
     /* main listener for upstream */
     i = pthread_create(&thrid_listen, NULL, (void * (*)(void *))thread_listen, NULL);
     if (i != 0) {
         MSG_ERR("[main] impossible to create listening thread\n");
-        exit(EXIT_FAILURE);
+        sniffer_exit();
     }
 
     /* Spectral scan auxiliary thread */
@@ -2343,7 +2712,7 @@ int main(int argc, char **argv) {
         i = pthread_create(&thrid_spectral, NULL, (void * (*)(void *))thread_spectral_scan, NULL);
         if (i != 0) {
             MSG_ERR("[main] impossible to create Spectral Scan thread\n");
-            exit(EXIT_FAILURE);
+            sniffer_exit();
         }
     }
 
@@ -2352,12 +2721,12 @@ int main(int argc, char **argv) {
         i = pthread_create(&thrid_gps, NULL, (void * (*)(void *))thread_gps, NULL);
         if (i != 0) {
             MSG_ERR("[main] impossible to create GPS thread\n");
-            exit(EXIT_FAILURE);
+            sniffer_exit();
         }
         i = pthread_create(&thrid_valid, NULL, (void * (*)(void *))thread_valid, NULL);
         if (i != 0) {
             MSG_ERR("[main] impossible to create validation thread\n");
-            exit(EXIT_FAILURE);
+            sniffer_exit();
         }
     }
 
@@ -2376,8 +2745,10 @@ int main(int argc, char **argv) {
 
         /* close current log and open a new one only if no interrupt signals have been given */
         if (!exit_sig && !quit_sig) {
-            log_close();
+            //log_close();
             log_open();
+
+            create_gw_report(); // Get our lovely gateway info going
 
             pthread_mutex_lock(&mx_meas_gps);
             if (gps_sync_fail == GPS_MAX_NO_SYNC) {
@@ -2429,7 +2800,7 @@ int main(int argc, char **argv) {
 
     if (exit_sig) {
         /* clean up before leaving */
-        stop_sniffer();
+        sniffer_stop();
         stat_cleanup();
     }
 
@@ -2439,7 +2810,7 @@ int main(int argc, char **argv) {
     MSG_INFO("Exiting packet sniffer program\n");
 
     /* close the log file */
-    log_close();
+    //log_close();
 
     return EXIT_SUCCESS;
 }
