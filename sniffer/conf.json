@@ -1,7 +1,7 @@
 {
     "SX130x_conf": {
-        "com_type": "USB",
-        "com_path": "/dev/ttyACM0",
+        "com_type": "SPI", /* Typically USB or SPI for the 2287 */
+        "com_path": "/dev/spidev0.0", /* For RAK5146 /dev/ttyACM0, for 2287 /dev/spidev0.0 */
         "lorawan_public": true,
         "clksrc": 0,
         "antenna_gain": 0, /* antenna gain, in dBi */
@@ -68,10 +68,12 @@
 
     "gateway_conf": {
         "gateway_ID": "001",
-        /* Reporting interval (in seconds) - currently 5 minutes */
-        "report_interval": 300,
-        /* Log generation (in seconds) - currently a day */  
-        "log_interval": 86400,
+        /* Reporting interval (in seconds) - currently 5 minutes [300] */
+        "report_interval": 60,
+        /* Log generation (in seconds) - currently a day [86400] */  
+        "log_interval": 43200, 
+        /* number of times statistics are generated within a single log file - currently 4 */
+        "stats_per_log" : 4,
         /* GPS configuration */
         "gps_tty_path": "/dev/ttyS0",
         /* GPS reference coordinates */

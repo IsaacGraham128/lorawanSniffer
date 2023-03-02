@@ -38,6 +38,7 @@ Maintainer: Sylvain Miermont
 
 #include <pthread.h>
 #include <sys/queue.h>  /* STAILQ queue */
+#include <sys/sendfile.h>
 
 #include <ctype.h>      /* isdigit */
 
@@ -89,15 +90,11 @@ Maintainer: Sylvain Miermont
 
 #define FILE_CPU_TEMP       "/sys/class/thermal/thermal_zone0/temp"
 #define FILE_RAM_INFO       "/proc/meminfo"
+#define FILE_WLAN0_STATS    "/proc/net/dev"
 
 #define JSON_REPORT_SUFFIX  ".json"
 
-#define JSON_FILE_ED        "ed_data_"
-#define JSON_FILE_CH        "ch_data_"
-
 #define JSON_REPORT_ED      "device"
-#define JSON_REPORT_CH      "channel"
-#define JSON_REPORT_GW      "gateway"
 
 /* JSON key fields for device and channel report information*/
 #define JSON_TIME           "@timestamp"
@@ -112,13 +109,6 @@ Maintainer: Sylvain Miermont
 #define JSON_FCNT           "FCnt"
 #define JSON_FREQ           "Freq"
 #define JSON_SF             "SF"
-#define JSON_START          "StartTime"
-#define JSON_END            "EndTime"
-#define JSON_UTIL           "Util"
-#define JSON_DEVSEEN        "DevSeen"
-#define JSON_MSGTOTAL       "MsgTotal"
-#define JSON_MSGUNIQ        "MsgUnique"
-#define JSON_MSGFAIL        "MsgFail"
 
 /* JSON key fields for gateway report information */
 #define JSON_TMP_CPU        "temp_cpu"
@@ -131,17 +121,11 @@ Maintainer: Sylvain Miermont
 #define JSON_MTYPE_LEN      4           /* Max length of the message type string, including null terminator */
 #define JSON_CRC_LEN        6           /* Max length of the CRC string, including null terminator */
 
-#define GPS_MAX_NO_SYNC     1000        /* maximum limit to failed sync attempts before reseting */
-#define GPS_SYNC_SILENCE    10          /* interval for number of failures before GPS logs failure message */
-#define GPS_REF_MAX_AGE     30          /* maximum admitted delay in seconds of GPS loss before considering latest GPS sync unusable */
-#define XERR_INIT_AVG       16          /* nb of measurements the XTAL correction is averaged on as initial value */
-#define XERR_FILT_COEF      256         /* coefficient for low-pass XTAL error tracking */
-
 #define MS_CONV             1000        /* conversion define to go from seconds to milliseconds*/
 #define UPLOAD_SLEEP        1           /* sleep time of the upload thread to check if its time to upload */
-#define GPS_SLEEP           1           /* sleep time of the GPS thread */
 #define DEFAULT_INT_REPORT  900         /* default time interval (seconds) for report uploading */
 #define DEFAULT_INT_LOG     1800        /* default time interval (seconds) for log usage */
+#define DEFAULT_INT_STATS   4           /* default number of stats generated per log file */
 
 #define SF_COUNT            6           /* Number of spreading factors to be used */ 
 #define SF_BASE             7           /* Lowest SF (7->12) */
@@ -160,33 +144,33 @@ Maintainer: Sylvain Miermont
 #define EXTRA_PHDR          8           /* Bytes allocated to LoRa transmission PHDR and PHDR_CRC */
 #define EXTRA_CRC           2           /* Bytes allocated to LoRa transmission CRC */
 
-#define INFO_ARRAY_DEFAULT  3           /* Initial space allocation for listening to devices */
-#define INFO_ARRAY_SCALER   1.67        /* Used for realloc increase factor */
-
 /* defines for AUTH0 and HTTP POST curl-ing */
-#define CURL_MIN_FAILS      3
-#define CURL_MAX_FAILS      5
+#define CURL_TARGET_DASH    0
+#define CURL_TARGET_AUTH0   1
+
+#define CURL_SUCCESS        0
+#define CURL_RERUN          1
+#define CURL_FAILURE        3
+
+#define CURL_SYS_SHIFT      8
+
+#define CURL_TIMEOUT_MIN    3
+#define CURL_TIMEOUT_MAX    5
+#define CURL_ERRORS_MAX     10
+
 #define CURL_OUTPUT         "out.json"
 #define CURL_PREFIX         "curl --connect-timeout 15 -o out.json -s -H \"Content-Type: application/json\""
 #define CURL_TEST           "curl --connect-timeout 15 -s"
 
+/* curl errors we actively deal with */
+#define CURL_ERR_SUCCESS    0
+#define CURL_ERR_NOCONNECT  7 // Do we really need this one???
+#define CURL_ERR_TIMEOUT    28
+#define CURL_ERR_CANTHANDLE -1
+#define CURL_ERR_CODES      99
+
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE TYPES -------------------------------------------------------- */
-
-/* basic device memory */
-typedef struct lora_device_s {
-    uint32_t        device_adr;     /* device address */
-    uint32_t        fcnt;           /* device fcount */
-} lora_device_t;
-
-/* spectral scan */
-typedef struct spectral_scan_s {
-    bool enable;            /* enable spectral scan thread */
-    uint32_t        freq_hz_start;  /* first channel frequency, in Hz */
-    uint8_t         nb_chan;        /* number of channels to scan (200kHz between each channel) */
-    uint16_t        nb_scan;        /* number of scan points for each frequency scan */
-    uint32_t        pace_s;         /* number of seconds between 2 scans in the thread */
-} spectral_scan_t;
 
 /* end device report */
 typedef struct ed_report_s {
@@ -202,34 +186,6 @@ typedef struct ed_report_s {
     float toa;
     bool adr;
 } ed_report_t;
-
-/* channel report */
-typedef struct ch_report_s {
-    char* timestamp;
-    char* start;
-    char* end;
-    float freq;
-    uint8_t sf;
-    float utilisation;
-    uint32_t msg_total;
-    uint32_t msg_unique;
-    uint32_t msg_failed; 
-} ch_report_t;
-
-/* channel/sf report info structs */
-typedef struct ch_info_s {
-    float freq;
-    uint8_t sf;
-    struct timespec start_time;
-    float total_airtime;
-    lora_device_t* devices;
-    lora_device_t* devices_tmp;
-    uint32_t list_len;
-    uint32_t device_count;
-    uint32_t msg_total;
-    uint32_t msg_unique;
-    uint32_t msg_failed; 
-} ch_info_t;
 
 /* struct for holding radio information configuration */
 typedef struct if_info_s {
@@ -247,8 +203,9 @@ struct entry {
 /* --- PRIVATE VARIABLES (GLOBAL) ------------------------------------------- */
 
 /* statistics collection configuration variables */
-static unsigned report_interval = DEFAULT_INT_REPORT; /* time interval (in sec) at which reports are uploaded */
-static unsigned log_interval = DEFAULT_INT_LOG; /* time interval (in sec) at which new log files are used */
+static unsigned report_interval = DEFAULT_INT_REPORT;   /* time interval (in sec) at which reports are uploaded */
+static unsigned log_interval = DEFAULT_INT_LOG;         /* time interval (in sec) at which new log files are used */
+static unsigned stats_per_log = DEFAULT_INT_STATS;
 
 /* signal handling variables */
 struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
@@ -257,16 +214,16 @@ static int quit_sig = 0; /* 1 -> application terminates without shutting down th
 
 /* STAILQ messaging head and initialisation */
 static pthread_mutex_t mx_report_dev = PTHREAD_MUTEX_INITIALIZER; /* control access to the device message queue */
-static pthread_mutex_t mx_report_ch = PTHREAD_MUTEX_INITIALIZER;  /* control access to the channel aggregate data */
 STAILQ_HEAD(stailhead, entry);
 static struct stailhead head;
 
 /* configuration variables needed by the application  */
 static uint64_t lgwm = 0; /* LoRa gateway MAC address */
-// static char lgwm_str[17];
 
-/* clock and log file management */
-static pthread_mutex_t mx_log = PTHREAD_MUTEX_INITIALIZER; /* control access to the log file */
+/* clock, log file, and statistics management */
+static pthread_mutex_t mx_log = PTHREAD_MUTEX_INITIALIZER;  /* control access to the log file */
+static int ed_reports_total = 0;                            /* statistics variables */
+static uint32_t packets_caught = 0;                         /* Total packets caught */
 static bool verbose = false;
 static bool continuous = false;
 static FILE * log_file = NULL;
@@ -279,36 +236,8 @@ static char url_auth0[80];         /* auth0 url for token collection */
 static char url_dash[80];          /* desired dashboard url */
 static char auth_key[800];         /* holds the bearer token string */
 
-
 /* hardware access control and correction */
-// TODOD : What happens if this is made static??
 static pthread_mutex_t mx_concent = PTHREAD_MUTEX_INITIALIZER; /* control access to the concentrator */
-static pthread_mutex_t mx_xcorr = PTHREAD_MUTEX_INITIALIZER; /* control access to the XTAL correction */
-static bool xtal_correct_ok = false; /* set true when XTAL correction is stable enough */
-static double xtal_correct = 1.0;
-
-/* GPS configuration and synchronization */
-static char gps_tty_path[64] = "\0"; /* path of the TTY port GPS is connected on */
-static int gps_tty_fd = -1; /* file descriptor of the GPS TTY port */
-static bool gps_enabled = true; /* is GPS enabled on that gateway ? */
-
-/* GPS time reference */
-static pthread_mutex_t mx_timeref = PTHREAD_MUTEX_INITIALIZER; /* control access to GPS time reference */
-static bool gps_ref_valid; /* is GPS reference acceptable (ie. not too old) */
-static struct tref time_reference_gps; /* time reference used for GPS <-> timestamp conversion */
-
-/* Reference coordinates, for broadcasting (beacon) */
-static struct coord_s reference_coord;
-
-/* Enable faking the GPS coordinates of the gateway */
-static bool gps_fake_enable; /* enable the feature */
-
-static pthread_mutex_t mx_meas_gps = PTHREAD_MUTEX_INITIALIZER; /* control access to the GPS statistics */
-static bool gps_coord_valid; /* could we get valid GPS coordinates ? */
-static struct coord_s meas_gps_coord;   /* GPS position of the gateway */
-static struct coord_s meas_gps_err;     /* GPS position of the gateway */
-static uint32_t gps_sync_fail = 0;      /* used to help silence the GPS and reset everything */
-static uint8_t gps_speak_cnt = 0;      /* used to help silence the GPS and reset everything */
 
 /* Gateway specificities */
 static int8_t antenna_gain = 0;
@@ -326,39 +255,20 @@ static int radio_group_current; /* Current radio group in use */
 static int radio_group_count;
 static struct lgw_conf_rxrf_s **rfconf; /* Matrix of radio groups [group][radio config] */
 
-/* Spectral Scan */
-static spectral_scan_t spectral_scan_params = {
-    .enable = false,
-    .freq_hz_start = 0,
-    .nb_chan = 0,
-    .nb_scan = 0,
-    .pace_s = 10
-};
+/* JSON writing management and control */
+/* the two sets of reports counters and mutexes should allow us to read and move the json encoded ED reports */
+/* almost certainly a better way to do this but oh well */
+static pthread_mutex_t mx_ed_report_0 = PTHREAD_MUTEX_INITIALIZER; /* control access to the ed_report_0 counter */
+static pthread_mutex_t mx_ed_report_1 = PTHREAD_MUTEX_INITIALIZER; /* control access to the ed_report_1 counter */
+static char report_string[100];
+static int ed_reports_0 = 0;
+static int ed_reports_1 = 0;
+static int ed_uploads_0 = 0;
+static int ed_uploads_1 = 0;
 
-/* JSON writing management */
-ch_info_t ch_report_info[LGW_MULTI_NB][SF_COUNT];
-static char report_string[75];
-static int ed_reports = 0;
-static int ch_reports = 0;
-
-/* JSOn statistics */
-static int ed_reports_total = 0;
-static int ch_reports_total = 0;
-
-
-
-/* -------------------------------------------------------------------------- */
-/* --- PRIVATE STATISTIC VARIABLES (GLOBAL) --------------------------------- */
-
-// Need to delete
-// uint16_t devices_seen;
-// lora_device_t *devices;
-
-// bool realloc_flag;
-// uint8_t *confirmed_retransmissions;     /* List of retransmission numbers for confirmed messages */
-// uint8_t *unconfirmed_retransmissions;   /* List of retransmission numbers for UNconfirmed messages */
-// uint8_t *b_confirmed_retransmissions;   /* Realloc list of retransmission numbers for confirmed messages */
-// uint8_t *b_unconfirmed_retransmissions; /* Realloc list of retransmission numbers for UNconfirmed messages */
+/* Curl failure prevention variables */
+static int curl_failures = 0;
+static int bad_file_count = 0;
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE FUNCTIONS DECLARATION ---------------------------------------- */
@@ -369,12 +279,25 @@ static void usage(void);
 static void sig_handler(int sigio);
 
 /* Gateway statistic gathering functions (ram available and total)*/
+static long line_get_first_number (char* line);
+
+static long line_get_specific_number (char* line, uint8_t desired_index);
+
+static float stat_get_ram_available (void);
+
+static float stat_get_ram_total (void);
+
+static float stat_get_temp_cpu (void);
+
+static float stat_get_temp_lgw (void);
+
+static int stat_get_wlan0_rx_tx (long *rx, long *tx);
+
 float get_ram_value(char* str);
 
 float get_cpu_temp (void);
 
 /* End device report writing object handlers */
-
 static ed_report_t* create_ed_report(void);
 
 static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct tm *xt, struct timespec *fetch_time);
@@ -383,31 +306,14 @@ static void reset_ed_report(ed_report_t* report);
 
 static void destroy_ed_report(ed_report_t* report);
 
-/* Channel report struct objects */
-
-static void create_ch_report(void);
-
-static void write_ch_report(ed_report_t* report, struct lgw_pkt_rx_s* pkt);
-
-static void reset_ch_report(void);
-
-static void destroy_ch_report(void);
-
 /* Report object encoding functions */
+static void create_file_string(char* dest, char* file_type, int index_mutex, int index_file);
 
-static void create_file_string(char* file_type, int index);
+static void encode_ed_report(ed_report_t *info, int index_mutex, int index_file);
 
-static void encode_ed_report(ed_report_t *info, int index);
+static void generate_sniffer_stats(void);
 
-static void encode_ch_report(ch_report_t *info, int index);
-
-static void create_gw_report(void);
-
-static void create_all_channel_reports(void);
-
-/* Auxilliary help functions*/
-
-static uint8_t find_channel_no(uint32_t freq);
+/* Auxilliary help functions */
 
 static int sniffer_start(void);
 
@@ -416,13 +322,11 @@ static int sniffer_stop(void);
 static void sniffer_exit(void);
 
 /* Radio configuration functions */
-
 static int init_radio_group(int group);
 
 static void stat_cleanup(void);
 
 /* Configuration parsing files */
-
 static int parse_SX130x_configuration(const char * conf_file);
 
 static int parse_gateway_configuration(const char * conf_file);
@@ -434,24 +338,20 @@ static int parse_upload_configuration(const char * conf_file);
 /* Log file interaction */
 static void log_open (void);
 
-static void log_close (void);
-
 /* curl HTTP post handling functions */
+static int curl_read_system (int system_output);
+
 static int curl_handle_timeout (char* url_to_check);
 
-static int curl_check_output (char * curl_string);
+static int curl_handle_output (int curl_target);
 
-static void curl_check_output_auth0 (char * curl_string);
+static int curl_parse (JSON_Value *root_val, int curl_target);
 
 static int curl_get_auth0 (void);
 
 static int curl_upload_file (const char * upload_file);
 
-/* Auxiliary GPS thread functions */
-
-static void gps_process_sync(void);
-
-static void gps_process_coords(void);
+static int save_unknown_response (const char* file_in);
 
 /* threads */
 void thread_listen(void);
@@ -492,71 +392,254 @@ static void sig_handler(int sigio) {
     return;
 }
 
-/**
- * Get the ram utilisation values found in /proc/meminfo by passing in the current
- * file reading line. Should be used in conjunction with getline().
+/** 
+ * Read a line given some string and return the first number found.
  * 
- * @param str   Pointer to the current file line
- * @return      The utilisation value in MiB
+ * If used when reading from file ensure that the stream is not closed.
+ * 
+ * @param line  The string to search
+ * @return      The number first found, else -1
 */
-float get_ram_value(char* str) {
+static long line_get_first_number (char* line) {
 
-    char* num;
-    float value = 0;
+    long num = -1;
 
-    num = str;
-
-    while (*num) {
-        if (isdigit(*num)) {
-            value = strtol(num, &num, 10);
+    while(*line) {
+        if (isdigit(*line)) {
+            num = strtol(line, &line, 10);
             break;
         }
-        num++;
+        line++;
     }
 
-    return value;
+    return num;
 }
 
 /**
- * Get the current CPU temperature.
+ * Reads a line and returns a number at the specific index. This refers to whole numbers
+ * seperated by white space.
  * 
- * @return  The current CPU temperature in degrees.
+ * NOTE: The line pointer is never reset to its original position...
+ * 
+ * @param line          The char pointer to shift
+ * @param desired_index The desired number index (range of 0 to 255)
+ * @return              -1 if the desired number couldnt be found, else the number
 */
-float get_cpu_temp (void) {
+static long line_get_specific_number (char* line, uint8_t desired_index) {
 
-    FILE *stream;
-    char *line = NULL;
-    char *num;
-    size_t len;
-    float value;
+    long num = -1;
+    uint8_t index = 0;
+    bool is_digit = false;
 
-    stream = fopen(FILE_CPU_TEMP, "r");
+    while(*line) {
+        if (isdigit(*line)) {
+            /* We have found a digit, are we at our desired index though? */
+            if (index == desired_index) {
+                num = strtol(line, &line, 10);
+                break;
+            }
+            is_digit = true;
+        } else {
+            /* We have found something that isnt a digit, lets handle */
+            if (is_digit) {
+                is_digit = false;
+                index++;
+            }
+        }
+        line++;
+    }
 
-    getline(&line, &len, stream);
-    num = line;
-    value = (float)strtol(num, &num, 10) / 1000.0;
+    return num;
+}
 
-    fclose(stream);
+/**
+ * Returns the current system RAM availability and returns it in MiB.
+ * 
+ * @return  Float of the current available system RAM in MiB, otherwise 0 indicating failure
+*/
+static float stat_get_ram_available (void) {
 
-    return value;
+    FILE* file = NULL;
+    char* line = NULL;
+    size_t len = 0;
+    float available = 0;
+
+    file = fopen(FILE_RAM_INFO, "r");
+
+    if (file == NULL) {
+        MSG_ERR("[stat_get_ram_available] Failed to open %s\n", FILE_RAM_INFO);
+        return available;
+    }
+
+    /* Sets pointer position to the third line of the file */
+    for (int i = 0; i < 3; i++)
+        getline(&line, &len, file);
+
+    available = (float)line_get_first_number(line);
+
+    if (available == -1) {
+        MSG_ERR("[stat_get_ram_available] Unable to get available RAM value\n");
+        available = 0;
+    } else {
+        available = available / 1024; /* Convert to mibibytes */
+    }
+
+    fclose(file);
+
+    return available;
+}
+
+/**
+ * Returns the current total RAM availability and returns it in MiB.
+ * 
+ * @return  Float of the current total system RAM in MiB, otherwise 0 indicating failure
+*/
+static float stat_get_ram_total (void) {
+
+    FILE* file = NULL;
+    char* line = NULL;
+    size_t len = 0;
+    float available = 0;
+
+    file = fopen(FILE_RAM_INFO, "r");
+
+    if (file == NULL) {
+        MSG_ERR("[stat_get_ram_total] Failed to open %s\n", FILE_RAM_INFO);
+        return available;
+    }
+
+    getline(&line, &len, file); /* Get first line of file*/
+
+    available = (float)line_get_first_number(line);
+
+    if (available == -1) {
+        MSG_ERR("[stat_get_ram_total] Unable to get total RAM value\n");
+        available = 0;
+    } else {
+        available = available / 1024; /* Convert to mibibytes */
+    }
+
+    fclose(file);
+
+    return available;
+}
+
+/**
+ * Returns the current temperature of the CPU.
+ * 
+ * @return  Temperature of the CPU, else 0 on error
+*/
+static float stat_get_temp_cpu (void) {
+
+    FILE* file = NULL;
+    char* line = NULL;
+    size_t len = 0;
+    float temp = 0;
+
+    file = fopen(FILE_CPU_TEMP, "r");
+
+    if (file == NULL) {
+        MSG_ERR("[stat_get_temp_cpu] Unable to open %s\n", FILE_CPU_TEMP);
+        return temp;
+    }
+
+    getline(&line, &len, file); /* Get first line of file*/
+
+    temp = (float)strtol(line, &line, 10) / 1000.0;
+
+    fclose(file);
+
+    return temp;
+}
+
+/**
+ * Gets the temperature of the lora gateway concentrator card.
+ * 
+ * @return Returns the termpature as a float, 0 on error otherwise
+*/
+static float stat_get_temp_lgw (void) {
+
+    int i;
+    float temp = 0;
+
+    pthread_mutex_lock(&mx_concent);
+    i = lgw_get_temperature(&temp);
+    pthread_mutex_unlock(&mx_concent);
+
+    if (i == LGW_HAL_ERROR) {
+        MSG_ERR("Failed to acquire concentrator temp\n");
+        temp = 0;
+    }
+
+    return temp;
+}
+
+/**
+ * Get the rx and tx stats of the wlan0 interface in bytes. Returned through pointers.
+ * 
+ * @param rx
+ * @param tx
+ * @return      0 on success, -1 on error
+*/
+static int stat_get_wlan0_rx_tx (long *rx, long *tx) {
+
+    FILE* file = NULL;
+    char* line = NULL;
+    size_t len = 0;
+    long rx_bytes = 0;
+    long tx_bytes = 0;
+
+    file = fopen(FILE_WLAN0_STATS, "r");
+
+    if (file == NULL) {
+        MSG_ERR("[stat_get_temp_cpu] Unable to open %s\n", FILE_WLAN0_STATS);
+        return -1;
+    }
+
+    /* Sets pointer position to the third line of the file */
+    for (int i = 0; i < 6; i++)
+        getline(&line, &len, file);
+
+    /* RX packets is at index 1, TX is at 9*/
+    rx_bytes = line_get_specific_number(line, 1);
+
+    if (rx_bytes == -1) {
+        MSG_ERR("[stat_get_temp_cpu] Failed to get desired RX index\n");
+        return -1;
+    }
+
+    tx_bytes = line_get_specific_number(line, 9);
+
+    if (tx_bytes == -1) {
+        MSG_ERR("[stat_get_temp_cpu] Failed to get desired TX index\n");
+        return -1;
+    }
+
+    *rx = rx_bytes;
+    *tx = tx_bytes;
+
+    fclose(file);
+
+    return 0;
 }
 
 /**
  * Create the appropriate string for a JSON file. User can define if the 
- * file is for a channel or device report, as well as its number. String is placed into
- * "report_string" variable.
+ * file is for a channel or device report, as well as its number.
  * 
- * @param file_type Either JSON_REPORT_ED or JSON_REPORT_CH
- * @param index     The number of the file
+ * @param dest          Char* to allocate the string to
+ * @param file_type     prefix of the file type (i.e. JSON_REPORT_ED)
+ * @param index_mutex   Index of the mutex to use
+ * @param index_file    Index of the file
 */
-static void create_file_string(char* file_type, int index) {
+static void create_file_string(char* dest, char* file_type, int index_mutex, int index_file) {
 
     char number[20];
-    memset(report_string, 0, 75);
-    sprintf(number, "%d", index);
-    strcat(report_string, file_type);
-    strcat(report_string, number);
-    strcat(report_string, JSON_REPORT_SUFFIX);
+    memset(dest, 0, 100);
+    sprintf(number, "%d_%d", index_mutex, index_file);
+    strcat(dest, file_type);
+    strcat(dest, number);
+    strcat(dest, JSON_REPORT_SUFFIX);
 }
 
 /**
@@ -599,7 +682,7 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
     mote_mhdr = p->payload[0];
     mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
 
-    sprintf(report->devaddr, "%x", mote_addr);
+    sprintf(report->devaddr, "%.8x", mote_addr);
 
     switch(mote_mhdr >> 5) {
         case 0b000 : sprintf(report->mtype, "JR");  break;
@@ -674,17 +757,23 @@ static void destroy_ed_report(ed_report_t* report) {
 /**
  * Create a JSON report for a given end device information struct.
  * 
- * @param info  ed_report_t containing all relevant transmission information
- * @param index Number of the report
+ * @param info          ed_report_t containing all relevant transmission information
+ * @param index_mutex   Index of the mutex to use
+ * @param index_file    Index of the file
 */
-static void encode_ed_report(ed_report_t *info, int index) {
+static void encode_ed_report(ed_report_t *info, int index_mutex, int index_file) {
 
     JSON_Value* root_value;
     JSON_Object* root_object;
     FILE* file;
     char* serialized_string = NULL;
+    char report_string[100];
 
-    create_file_string(JSON_REPORT_ED, index);
+    create_file_string(report_string, JSON_REPORT_ED, index_mutex, index_file);
+
+    // if (index_mutex == 1) encode_ed_report(info, 69, index_file); // Hello this is my debug line!
+
+    // MSG_INFO("[encode_ed_report] Encoding file %s\n", report_string);
 
     file = fopen(report_string, "w");
 
@@ -704,7 +793,6 @@ static void encode_ed_report(ed_report_t *info, int index) {
     json_object_set_boolean(root_object, JSON_ADR,      info->adr);
     
     serialized_string = json_serialize_to_string(root_value);
-    //serialized_string = json_serialize_to_string_pretty(root_value);
     fputs(serialized_string, file);
 
     json_free_serialized_string(serialized_string);
@@ -713,339 +801,36 @@ static void encode_ed_report(ed_report_t *info, int index) {
 }
 
 /**
- * Create a JSON report for a given channel and spreading factor information struct.
- * 
- * @param info  ch_report_t containing all relevant channel activity information
- * @param index Number of the report
+ * Gather all stats relative to the sniffer and print them.
+ *
+ * Currently acquires:
+ *  - Pi CPU temp
+ *  - LGW concentrator temp
+ *  - Total system ram
+ *  - Total available system ram
 */
-static void encode_ch_report(ch_report_t *info, int index) {
+static void generate_sniffer_stats (void) {
 
-    JSON_Value* root_value;
-    JSON_Object* root_object;
-    FILE* file;
-    char* serialized_string = NULL;
+    float temp_cpu, temp_con, ram_total, ram_available;
+    long rx = 0;
+    long tx = 0;
 
-    create_file_string(JSON_REPORT_CH, index);
+    temp_cpu = stat_get_temp_cpu();
+    temp_con = stat_get_temp_lgw();
+    ram_total = stat_get_ram_total();
+    ram_available = stat_get_ram_available();
 
-    file = fopen(report_string, "w");
+    stat_get_wlan0_rx_tx(&rx, &tx);
 
-    root_value = json_value_init_object();
-    root_object = json_value_get_object(root_value);
-    json_object_set_string(root_object, JSON_TIME,      info->timestamp);
-    json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_CH);
-    json_object_set_string(root_object, JSON_START,     info->start);
-    json_object_set_string(root_object, JSON_END,       info->end);
-    json_object_set_number(root_object, JSON_FREQ,      info->freq);
-    json_object_set_number(root_object, JSON_SF,        info->sf);
-    json_object_set_number(root_object, JSON_UTIL,      info->utilisation);
-    json_object_set_number(root_object, JSON_MSGTOTAL,  info->msg_total);
-    json_object_set_number(root_object, JSON_MSGUNIQ,   info->msg_unique);
-    json_object_set_number(root_object, JSON_MSGFAIL,   info->msg_failed);
-
-    serialized_string = json_serialize_to_string(root_value);
-    //serialized_string = json_serialize_to_string_pretty(root_value);
-    fputs(serialized_string, file);
-
-    json_free_serialized_string(serialized_string);
-    json_value_free(root_value);
-    fclose(file);
-}
-
-/**
- * Create a JSON report for the current gateway statistics.
-*/
-static void create_gw_report (void) {
-
-    struct timespec fetch_time;
-    struct tm *xt;
-    JSON_Value *root_value;
-    JSON_Object *root_object;
-    FILE* file = NULL;
-    size_t len;
-    char *serialized_string = NULL;
-    char *line;
-    char *timestamp = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
-
-    /* Variables for utilisation and statistics */
-    int i;
-    float temp_cpu, temp_con;
-    uint16_t ram_total, ram_available;
-    
-    temp_cpu = 0;
-    temp_cpu = get_cpu_temp();
-
-    temp_con = 0;
-
-    pthread_mutex_lock(&mx_concent);
-    i = lgw_get_temperature(&temp_con);
-    pthread_mutex_unlock(&mx_concent);
-
-    if (i == LGW_HAL_ERROR) {
-        MSG_ERR("Failed to acquire concentrator temp\n");
-        temp_con = 0;
-    }
-
-    /* Acquire ram utilisation values */
-    file = fopen(FILE_RAM_INFO,"r");
-
-    if (file == NULL) {
-        MSG_ERR("[main] Unable to open RAM info file\n");
-        sniffer_exit();
-    }
-
-    getline(&line, &len, file);                 /* get the total system ram */
-    ram_total = get_ram_value(line) / 1024;     /* convert to mibi bytes */
-    getline(&line, &len, file);                 /* skip this line, we dont care about free */   
-    getline(&line, &len, file);                 /* get the available system ram */   
-    ram_available = get_ram_value(line) / 1024; /* convert to mibi bytes */
-    fclose(file);
-    
     MSG_INFO("Pi Temp: %fC\n", temp_cpu);
     MSG_INFO("LGW Temp: %fC\n", temp_con);
-    MSG_INFO("Total RAM: %dMiB\n", ram_total);
-    MSG_INFO("Available RAM %dMiB\n", ram_available);
+    MSG_INFO("Total RAM: %fMiB\n", ram_total);
+    MSG_INFO("Available RAM %fMiB\n", ram_available);
+    MSG_INFO("WLAN0 RX: %lu\n", rx);
+    MSG_INFO("WLAN0 TX: %lu\n", tx);
+    MSG_INFO("Total packets caught %lu\n", (unsigned long)packets_caught);
+    MSG_INFO("Total packets uploaded %d\n", ed_reports_total);
 
-    /* Now continue log information as usual */
-    clock_gettime(CLOCK_REALTIME, &fetch_time);
-    xt = gmtime(&(fetch_time.tv_sec));
-    sprintf(timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
-
-    create_file_string(JSON_REPORT_GW, 0);
-
-    file = fopen(report_string, "w");
-
-    root_value = json_value_init_object();
-    root_object = json_value_get_object(root_value);
-    json_object_set_string(root_object, JSON_TIME,      timestamp);
-    json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_GW);
-    json_object_set_number(root_object, JSON_TMP_CPU,   temp_cpu);
-    json_object_set_number(root_object, JSON_TMP_CON,   temp_con);
-    json_object_set_number(root_object, JSON_RAM_TOTL,  ram_total);
-    json_object_set_number(root_object, JSON_RAM_AVAL,  ram_available);
-    
-    serialized_string = json_serialize_to_string(root_value);
-    fputs(serialized_string, file);
-
-    json_free_serialized_string(serialized_string);
-    json_value_free(root_value);
-    fclose(file);
-
-    free((void*)timestamp);
-}
-
-/**
- * Create all channel report json files based of the ch_report_info matrix.
-*/
-static void create_all_channel_reports(void) {
-
-    struct timespec fetch_time;
-    struct tm *xt;
-    ch_info_t *ch_info;
-    ch_report_t *ch_report;
-    char *start_time;
-    char *end_time;
-    float utilisation;
-    
-    start_time = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
-    end_time = (char*)malloc(sizeof(char) * JSON_TIME_LEN);
-    
-    ch_report = (ch_report_t*)calloc(1, sizeof(ch_report_t));
-
-    clock_gettime(CLOCK_REALTIME, &fetch_time);
-    xt = gmtime(&(fetch_time.tv_sec));
-    sprintf(end_time, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
-
-    for (int i = 0; i < LGW_MULTI_NB; i++) {
-        for (int j = 0; j < SF_COUNT; j++) {
-            if (ch_report_info[i][j].device_count) {
-                ch_info = &ch_report_info[i][j];
-
-                xt = gmtime(&(ch_info->start_time.tv_sec));
-                sprintf(start_time, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time.tv_nsec)/1000000); /* ISO 8601 format */
-
-                ch_report->timestamp = end_time;
-                ch_report->start = start_time;
-                ch_report->end = end_time;
-
-                ch_report->freq = ch_info->freq;
-                ch_report->sf = ch_info->sf;
-
-                ch_report->msg_total = ch_info->msg_total;
-                ch_report->msg_unique = ch_info->msg_unique;
-                ch_report->msg_failed = ch_info->msg_failed;
-
-                utilisation = ch_info->total_airtime / (float)(fetch_time.tv_sec - ch_info->start_time.tv_sec);
-
-                ch_report->utilisation = utilisation * 1e2; // Move up to percentile
-
-                encode_ch_report(ch_report, ch_reports++);
-            }
-        }
-    }
-
-    free((void*)start_time);
-    free((void*)end_time);
-    free((void*)ch_report);
-}
-
-/**
- * Create all of the necessary channel report information structs used to store
- * information necessary to generating the channel report info
-*/
-static void create_ch_report (void) {
-
-    ch_info_t *ch_info;
-    uint32_t radio_0_freq, radio_1_freq;
-    struct timespec fetch_time;
-
-    clock_gettime(CLOCK_REALTIME, &fetch_time);
-    
-    radio_0_freq = rfconf[radio_group_current][0].freq_hz;
-    radio_1_freq = rfconf[radio_group_current][1].freq_hz;
-
-    for (int i = 0; i < LGW_MULTI_NB; i++) {
-        for (int j = 0; j < SF_COUNT; j++) {
-            // Get ch report info struct and assign to pointer for nicer looking code
-            ch_info = &ch_report_info[i][j];
-            
-            // Clear the memory and set the variables
-            // Could alternatively use a memset?
-            ch_info->start_time = fetch_time;
-            ch_info->devices = (lora_device_t*)calloc(INFO_ARRAY_DEFAULT, sizeof(lora_device_t));
-            ch_info->list_len = INFO_ARRAY_DEFAULT;
-            ch_info->freq = if_info[i].radio ? radio_1_freq : radio_0_freq;
-            ch_info->freq = (ch_info->freq + if_info[i].freq_if) / 1e6;
-            ch_info->sf = (SF_BASE + j);
-            ch_info->total_airtime = 0;
-            ch_info->device_count = 0;
-            ch_info->msg_total = 0;
-            ch_info->msg_unique = 0;
-            ch_info->msg_failed = 0;
-        }
-    }
-}
-
-/**
- * Update channel report struct given a recieved packet.
- * 
- * @param   report  The encoded packet information
- * @param   p       The raw packet information
-*/
-static void write_ch_report (ed_report_t* report, struct lgw_pkt_rx_s* p) {
-
-    ch_info_t *ch_info;
-    lora_device_t *ch_device;
-    bool dev_found = false;
-    uint32_t mote_addr;
-
-    for (int i = 0; i < LGW_MULTI_NB; i++) {
-        if (report->freq == ch_report_info[i][0].freq) {
-
-            ch_info = &ch_report_info[i][report->sf - SF_BASE];
-
-            /* Get device address */
-            mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
-
-            /* increment channel airtime */
-            ch_info->total_airtime += report->toa / 1e3; // Convert to seconds
-
-            /* find if the device already exists in this ch reports memory */
-            for (uint32_t g = 0; g < ch_info->device_count + 1; g++) {
-                if (ch_info->devices[g].device_adr == mote_addr) {
-                    ch_device = &ch_info->devices[g];
-                    dev_found = true;
-                    break;
-                }
-            }
-
-            /* increment our message counters */
-            ch_info->msg_total++;
-            if (p->status != STAT_CRC_OK) {
-                ch_info->msg_failed++;
-            }
-
-            /* handle counters and device listing memory */
-            if (dev_found) {
-                if (report->fcnt != ch_device->fcnt) {
-                    ch_device->fcnt = report->fcnt;
-                    ch_info->msg_unique++;
-                }
-                dev_found = false; // set to false for next device analysis
-            } else {
-                ch_info->devices[ch_info->device_count].device_adr = mote_addr;
-                ch_info->devices[ch_info->device_count].fcnt = report->fcnt;
-                ch_info->device_count++;
-
-                /* check list size, realloc if we have filled the buffer */
-                if (ch_info->device_count == ch_info->list_len) {
-                    ch_info->list_len *= INFO_ARRAY_SCALER;
-                    ch_info->devices_tmp = (lora_device_t*)realloc(ch_info->devices, ch_info->list_len * sizeof(lora_device_t));
-                    if (ch_info->devices_tmp == NULL) {
-                        MSG_ERR("Realloc failed\n");
-                        sniffer_exit();
-                    }
-                    ch_info->devices = ch_info->devices_tmp;
-                }
-            }
-
-            break;
-        }
-    }
-}
-
-/**
- * Assign new timestamp and (if messages were caught) clear associated statistic memory. 
- * Use when entering a new listening period.
-*/
-static void reset_ch_report (void) {
-
-    ch_info_t *ch_info;
-    struct timespec fetch_time;
-
-    clock_gettime(CLOCK_REALTIME, &fetch_time);
-
-    for (int i = 0; i < LGW_MULTI_NB; i++) {
-        for (int j = 0; j < SF_COUNT; j++) {
-
-            ch_info = &ch_report_info[i][j];
-
-            /* Set new timestamp */
-            ch_info->start_time = fetch_time;
-
-            /* If device count higher than 0, clear all tracking fields and clear array memory */
-            if (ch_info->device_count) {
-                ch_info->devices = (lora_device_t*)calloc(ch_info->list_len, sizeof(lora_device_t));
-                ch_info->total_airtime = 0;
-                ch_info->device_count = 0;
-                ch_info->msg_total = 0;
-                ch_info->msg_unique = 0;
-                ch_info->msg_failed = 0;
-            }
-        }
-    }
-}
-
-/**
- * Cleanup allocated memory given to each ch_info piece
-*/
-static void destroy_ch_report (void) {
-
-    for (int i = 0; i < LGW_MULTI_NB; i++) {
-        for (int j = 0; j < SF_COUNT; j++) {
-            free((void*)ch_report_info[i][j].devices);
-        }
-    }
-}
-
-/**
- * Utility function to find the corresponding channel for a given frequency.
- * 
- * @param freq  Frequency to find channel number of
- * @return      Equivalent channel number
- */
-static uint8_t find_channel_no(uint32_t freq) {
-    double chan = (freq - 915200000) / 200e3;
-    return (uint8_t)chan;
 }
 
 /**
@@ -1056,6 +841,14 @@ static uint8_t find_channel_no(uint32_t freq) {
 static int sniffer_start(void) {
 
     int i;
+
+    if (com_type == LGW_COM_SPI) {
+        /* Board reset */
+        if (system("./reset_lgw.sh start") != 0) {
+            printf("ERROR: failed to reset SX1302, check your reset_lgw.sh script\n");
+            exit(EXIT_FAILURE);
+        }
+    }
 
     i = lgw_start();
 
@@ -1081,10 +874,18 @@ static int sniffer_stop(void) {
     i = lgw_stop();
 
     if (i == LGW_HAL_SUCCESS) {
-        MSG_INFO("concentrator stopped successfully\n");
+        MSG_INFO("Concentrator stopped successfully\n");
     } else {
-        MSG_WARN("failed to stop concentrator successfully\n");
+        MSG_WARN("Failed to stop concentrator successfully\n");
         return -1;
+    }
+
+    if (com_type == LGW_COM_SPI) {
+        /* Board reset */
+        if (system("./reset_lgw.sh stop") != 0) {
+            printf("ERROR: failed to reset SX1302, check your reset_lgw.sh script\n");
+            exit(EXIT_FAILURE);
+        }
     }
 
     return 0;
@@ -1149,7 +950,6 @@ static int parse_SX130x_configuration(const char * conf_file) {
     JSON_Object *conf_obj = NULL;
     JSON_Object *conf_ts_obj;
     JSON_Object *conf_sx1261_obj = NULL;
-    JSON_Object *conf_scan_obj = NULL;
     JSON_Array *conf_demod_array = NULL;
 
     struct lgw_conf_board_s boardconf;
@@ -1295,51 +1095,6 @@ static int parse_SX130x_configuration(const char * conf_file) {
         } else {
             MSG_WARN("Data type for sx1261_conf.rssi_offset seems wrong, please check\n");
             sx1261conf.rssi_offset = 0;
-        }
-
-        /* Spectral Scan configuration */
-        conf_scan_obj = json_object_get_object(conf_sx1261_obj, "spectral_scan"); /* fetch value (if possible) */
-        if (conf_scan_obj == NULL) {
-            MSG_INFO("no configuration for Spectral Scan\n");
-        } else {
-            val = json_object_get_value(conf_scan_obj, "enable"); /* fetch value (if possible) */
-            if (json_value_get_type(val) == JSONBoolean) {
-                /* Enable background spectral scan thread in packet forwarder */
-                spectral_scan_params.enable = (bool)json_value_get_boolean(val);
-            } else {
-                MSG_WARN("Data type for spectral_scan.enable seems wrong, please check\n");
-            }
-            if (spectral_scan_params.enable == true) {
-                /* Enable the sx1261 radio hardware configuration to allow spectral scan */
-                sx1261conf.enable = true;
-                MSG_INFO("Spectral Scan with SX1261 is enabled\n");
-
-                /* Get Spectral Scan Parameters */
-                val = json_object_get_value(conf_scan_obj, "freq_start"); /* fetch value (if possible) */
-                if (json_value_get_type(val) == JSONNumber) {
-                    spectral_scan_params.freq_hz_start = (uint32_t)json_value_get_number(val);
-                } else {
-                    MSG_WARN("Data type for spectral_scan.freq_start seems wrong, please check\n");
-                }
-                val = json_object_get_value(conf_scan_obj, "nb_chan"); /* fetch value (if possible) */
-                if (json_value_get_type(val) == JSONNumber) {
-                    spectral_scan_params.nb_chan = (uint8_t)json_value_get_number(val);
-                } else {
-                    MSG_WARN("Data type for spectral_scan.nb_chan seems wrong, please check\n");
-                }
-                val = json_object_get_value(conf_scan_obj, "nb_scan"); /* fetch value (if possible) */
-                if (json_value_get_type(val) == JSONNumber) {
-                    spectral_scan_params.nb_scan = (uint16_t)json_value_get_number(val);
-                } else {
-                    MSG_WARN("Data type for spectral_scan.nb_scan seems wrong, please check\n");
-                }
-                val = json_object_get_value(conf_scan_obj, "pace_s"); /* fetch value (if possible) */
-                if (json_value_get_type(val) == JSONNumber) {
-                    spectral_scan_params.pace_s = (uint32_t)json_value_get_number(val);
-                } else {
-                    MSG_WARN("Data type for spectral_scan.pace_s seems wrong, please check\n");
-                }
-            }
         }
 
         /* all parameters parsed, submitting configuration to the HAL */
@@ -1570,43 +1325,14 @@ static int parse_gateway_configuration(const char * conf_file) {
     val = json_object_get_value(conf_obj, "log_interval");
     if (val != NULL) {
         log_interval = (unsigned)json_value_get_number(val);
-        MSG_INFO("statistics display interval is configured to %u seconds\n", log_interval);
+        MSG_INFO("log creation is every %u seconds\n", log_interval);
     }
 
-    /* GPS module TTY path (optional) */
-    str = json_object_get_string(conf_obj, "gps_tty_path");
-    if (str != NULL) {
-        strncpy(gps_tty_path, str, sizeof gps_tty_path);
-        gps_tty_path[sizeof gps_tty_path - 1] = '\0'; /* ensure string termination */
-        MSG_INFO("GPS serial port path is configured to \"%s\"\n", gps_tty_path);
-    }
-
-    /* get reference coordinates */
-    val = json_object_get_value(conf_obj, "ref_latitude");
+    /* get interval (in seconds) for changing log files (optional) */
+    val = json_object_get_value(conf_obj, "stats_per_log");
     if (val != NULL) {
-        reference_coord.lat = (double)json_value_get_number(val);
-        MSG_INFO("Reference latitude is configured to %f deg\n", reference_coord.lat);
-    }
-    val = json_object_get_value(conf_obj, "ref_longitude");
-    if (val != NULL) {
-        reference_coord.lon = (double)json_value_get_number(val);
-        MSG_INFO("Reference longitude is configured to %f deg\n", reference_coord.lon);
-    }
-    val = json_object_get_value(conf_obj, "ref_altitude");
-    if (val != NULL) {
-        reference_coord.alt = (short)json_value_get_number(val);
-        MSG_INFO("Reference altitude is configured to %i meters\n", reference_coord.alt);
-    }
-
-    /* Gateway GPS coordinates hardcoding (aka. faking) option */
-    val = json_object_get_value(conf_obj, "fake_gps");
-    if (json_value_get_type(val) == JSONBoolean) {
-        gps_fake_enable = (bool)json_value_get_boolean(val);
-        if (gps_fake_enable == true) {
-            MSG_INFO("fake GPS is enabled\n");
-        } else {
-            MSG_INFO("fake GPS is disabled\n");
-        }
+        stats_per_log = (unsigned)json_value_get_number(val);
+        MSG_INFO("%u statistic generations per log file\n", stats_per_log);
     }
 
     /* free JSON parsing data structure */
@@ -1760,27 +1486,49 @@ static void log_open (void) {
 }
 
 /**
- * Close logging file.
+ * Function used to specifically read the output given by a curl string run within the 
+ * "system" function.
+ * 
+ * Curl error codes bizzarely shifted 8 places left by system output. Need to move
+ * and then parse.
+ * 
+ * Returns the curl output if it succeeds or can be dealt with.
+ * 
+ * @param system_output The system code to analyse
+ * @return              The curl return code that can be handled, either CURL_ERR_SUCCESS or CURL_ERR_TIMEOUT
 */
-static void log_close (void) {
+static int curl_read_system (int system_output) {
 
-    int i;
+    int curl_output = system_output >> CURL_SYS_SHIFT; // Get only 8 bits
 
-    i = fclose(log_file);
+    /* Check if the curl error code was something weird we can't handle */
+    if (curl_output != CURL_ERR_SUCCESS && curl_output != CURL_ERR_TIMEOUT) {
+        MSG_WARN("[uploader] Encountered curl error that cannot be dealth with\n");
+        MSG_WARN("[uploader] Curl code %d (system return code %d)\n", curl_output, system_output);
 
-    if (i < 0) {
-        MSG_ERR("Failed to close log file\n");
-        sniffer_exit();
+        curl_failures++;
+
+        /* Check if the curl has failed too many times sequentially */
+        if (curl_failures > CURL_ERRORS_MAX) {
+            MSG_ERR("[uploader] Reached maximum number of permitted curl failures (CURL_ERRORS_MAX). Exiting\n");
+            sniffer_exit();
+        }
+
+        return CURL_ERR_CANTHANDLE;
     }
+
+    curl_failures = 0;
+
+    return curl_output;
 }
 
 /**
  * Checks for curl timeout, and now manages a failed counter. If the fail counter hits the minimum
- * value (CURL_MIN_FAILS), the VPN tun0 will be closed and reopened. Should the fail counter exceed
- * the maximum value (CURL_MAX_FAILS), the program will exit.
+ * value (CURL_TIMEOUT_MIN), the VPN tun0 will be closed and reopened. Should the fail counter exceed
+ * the maximum value (CURL_TIMEOUT_MAX), the program will exit.
  * 
  * @param url_to_check  The url which the curl failed to reach
- * @return              -1 if the curls fail, 0 if a connection was restablished
+ * @return              -1 if the curls fail, 1 if a connection was restablished
 */
 static int curl_handle_timeout (char* url_to_check) {
 
@@ -1789,7 +1537,11 @@ static int curl_handle_timeout (char* url_to_check) {
 
     MSG_INFO("[uploader] Curl timeout occured after 15 seconds. Retrying connection to %s\n", url_to_check);
 
-    if (failed_curls == CURL_MIN_FAILS) {
+    /* First check the number of curl failures passes a certain threshold */
+    if (failed_curls == CURL_TIMEOUT_MIN) {
+
+        MSG_INFO("[uploader] Minimum curl failures hit. Closing and reopening VPN tun0\n");
+
         status = system("sudo ifconfig tun0 down");
 
         if (status) {
@@ -1805,7 +1557,7 @@ static int curl_handle_timeout (char* url_to_check) {
             MSG_ERR("[uploader] Errno was %d\n", errno);
             sniffer_exit();
         }
-    } else if (failed_curls > CURL_MAX_FAILS) {
+    } else if (failed_curls > CURL_TIMEOUT_MAX) {
         MSG_ERR("[uploader] Max number of curl reattempts failed. Exiting\n");
         sniffer_exit();
     }
@@ -1816,13 +1568,14 @@ static int curl_handle_timeout (char* url_to_check) {
     for (i = 0; i < 4; i++) {
         MSG_INFO("[uploader] Curl reestablish attempt %d\n", i);
 
-        status = system((const char*)curl_string);
+        status = system((const char*)curl_string); // Run curl
+        status = curl_read_system(status); // Parse system curl output
 
         /* Check to see if the curl successfully returns */
-        if (!status) {
+        if (status == CURL_ERR_SUCCESS) {
             MSG_INFO("[uploader] Curl connection reestablished\n");
             failed_curls = 0;
-            return 0;
+            return 1;
         }   
     }
 
@@ -1841,46 +1594,33 @@ static int curl_handle_timeout (char* url_to_check) {
  * 
  * If response recieves unauthorized error, acquire new key, else exit.
  * 
- * @param curl_string   The curl string used to achieve the output. 
+ * @param curl_target   The specific curl type we need to parse based on. 
  * 
- * @return              -1 on timeout, 0 otherwise
+ * @return              -1 on failure, 0 on success, 1 for re-established connection during auth0
 */
-static int curl_check_output (char * curl_string) {
+static int curl_handle_output (int curl_target) {
 
     int i;
-    const char* str;
     FILE* fp_out;
     JSON_Value *root_val = NULL;
-
+    
     fp_out = fopen(CURL_OUTPUT, "r");
     i = fgetc(fp_out);
     fclose(fp_out);
 
-    if (i == EOF) {
-        /* File successfully uploaded */
-    } else {
-        /* JSON response not empty, need to investigate and handle */
+    /* Check if file is not empty */
+    if (i != EOF) {
+        /* Lets parse try to pass as JSON */
         root_val = json_parse_file(CURL_OUTPUT);
 
-        if (root_val == NULL) {
-            MSG_ERR("[uploader] Received curl response that was not a JSON response\n");
-            MSG_ERR("[uploader] Curl request string was %s\n", curl_string);
-            MSG_ERR("[uploader] Check %s for more details\n", CURL_OUTPUT);
-            sniffer_exit();
+        if (root_val != NULL) {
+            i = curl_parse(root_val, curl_target);
+            if (i) return i;
         } else {
-            str = json_object_get_string(json_value_get_object(root_val), "message");
-
-            if (str == NULL || strncmp(str, "Unauthorized", 12)) {
-                MSG_ERR("[uploader] Unknown JSON curl response received.\n");
-                MSG_ERR("[uploader] Curl request string was %s\n", curl_string);
-                sniffer_exit();
-            } else {
-                MSG_INFO("[uploader] Received response {\"message\":\"Unauthorized\"}. Acquiring new key.\n");
-                i = curl_get_auth0();
-
-                if (i)
-                    return -1;
-            }
+            /* Not JSON file found, lets save it */
+            save_unknown_response(CURL_OUTPUT);
+            save_unknown_response(report_string);
+            //return 0;
         }
     }
 
@@ -1888,32 +1628,42 @@ static int curl_check_output (char * curl_string) {
 }
 
 /**
- * Check curl auth0 request output.
+ * Specifically parse the curl output return based on the desired target.
+ * Currently either CURL_TARGET_DASH or CURL_TARGET_AUTH0
  * 
- * Ideally check for access key, otherwise check for errors, output to log,
- * and then exit.
- * 
- * @param curl_string   The curl string
+ * @param root_val      The root value of the ideally JSON output file
+ * @param curl_target   The curl type we are handling for
+ * @return              -1 on failure, 0 on success, 1 in the case auth0 curl request re-establishes a connection
 */
-static void curl_check_output_auth0 (char * curl_string) {
+static int curl_parse (JSON_Value *root_val, int curl_target) {
 
+    int i;
     const char* str;
-    JSON_Value *root_val = NULL;
 
-    root_val = json_parse_file(CURL_OUTPUT);
+    if (curl_target == CURL_TARGET_DASH) {
+        /* We are looking specifically for the message field */
+        str = json_object_get_string(json_value_get_object(root_val), "message");
 
-    if (root_val == NULL) {
-        MSG_ERR("[uploader] Received curl response that was not a JSON response\n");
-        MSG_ERR("[uploader] Curl request string was %s\n", curl_string);
-        MSG_ERR("[uploader] Check %s for more details\n", CURL_OUTPUT);
-        sniffer_exit();
-    } else {
+        if (str == NULL || strncmp(str, "Unauthorized", 12)) {
+            /* Unknown JSON response from dash, lets save it */
+            save_unknown_response(CURL_OUTPUT);
+            save_unknown_response(report_string);
+            //return -1;
+        } else {
+            MSG_INFO("[curl_parse] Received response {\"message\":\"Unauthorized\"}. Acquiring new key.\n");
+            i = curl_get_auth0();
+            if (i) return i; // Returns a special variable based on curl_get_auth0 function
+        }
+
+    } else if (curl_target == CURL_TARGET_AUTH0) {
+        /* First check for errors */
         str = json_object_get_string(json_value_get_object(root_val), "error");
 
         if (str == NULL) {
-            /* NULL string catch to prevent things breaking */
+            /* Check for NULL here or the strncmp breaks */    
         } else if (!strncmp(str, "access_denied", 13)) {
-            MSG_ERR("[uploader] Access denied. Check selected client secret json file.\n");
+            /* Unknown JSON response from auth0, lets save it */
+            MSG_ERR("[curl_parse] Auth0 Access denied. Check selected client secret json file.\n");
             sniffer_exit();
         }
 
@@ -1923,19 +1673,22 @@ static void curl_check_output_auth0 (char * curl_string) {
             /* we have found a bearer key, lets save it!!!!! */
             memset(auth_key, 0, sizeof auth_key);
             strcpy(auth_key, str);
-
-            MSG_INFO("[uploader] New AUTH key acquired\n");
-
+            MSG_INFO("[curl_parse] New AUTH key acquired\n");
         } else {
-            MSG_ERR("[uploader] Unknown JSON curl response received.\n");
-            MSG_ERR("[uploader] Curl request string was %s\n", curl_string);;
-            sniffer_exit();
+            /* Not JSON file found, lets save it */
+            save_unknown_response(CURL_OUTPUT);
+            save_unknown_response(report_string);
+            //return -1;
         }
     }
+
+    return 0;
 }
 
 /**
  * Complete auth0 request to acquirer bearer key for dashboard HTTP POST.
+ * 
+ * @return  -1 on failure, 1 on re-established connection AND getting new AUTH
 */
 static int curl_get_auth0 (void) {
 
@@ -1945,16 +1698,15 @@ static int curl_get_auth0 (void) {
     sprintf(curl_string, "%s -d @%s %s", CURL_PREFIX, file_client_key, url_auth0);
 
     status = system((const char*)curl_string);
+    status = curl_read_system(status); // Parse system output
 
-    if (!status) {
+    if (status == CURL_ERR_SUCCESS) {
         /* Successful curl, lets see the output */
-        curl_check_output_auth0(curl_string);
-    } else if (status == 7168) {
+        curl_handle_output(CURL_TARGET_AUTH0);
+    } else if (status == CURL_ERR_TIMEOUT) {
         /* Timeout status has returned, lets handle it and explore what went wrong */
         if (curl_handle_timeout(url_auth0)) {
             return -1;
-        } else {
-            return 1;
         }
     } else {
         /* Unknown error, we are leaving */
@@ -1962,7 +1714,7 @@ static int curl_get_auth0 (void) {
         sniffer_exit();
     }
 
-    return 0;
+    return 1;
 }
 
 /**
@@ -1982,37 +1734,90 @@ static int curl_upload_file (const char * upload_file) {
     sprintf(curl_string, "%s -H \"Authorization: Bearer %s\" -d @%s %s", CURL_PREFIX, auth_key, upload_file, url_dash);
 
     status = system((const char*)curl_string);
+    status = curl_read_system(status);
 
-    if (!status) {
+    if (status == CURL_ERR_SUCCESS) {
         /* Successful curl, lets see the output */
-        curl_check_output(curl_string);
-    } else if (status == 7168) {
+
+        //TODO: Need to investigate here next
+        // Work on haing it so that we ignore atleast a few weird messages
+
+        status = curl_handle_output(CURL_TARGET_DASH);
+
+        return status;
+        
+        /* Lets handle any known statuses here */
+    } else if (status == CURL_ERR_TIMEOUT) {
         /* Timeout status has returned, lets handle it and explore what went wrong */
-        if (curl_handle_timeout(url_dash)) {
-            return -1;
-        } else {
-            return 1;
-        }
+        MSG_WARN("[curl_upload_file] Curl timeout detected. Handling\n");
+        status = curl_handle_timeout(url_dash);
+        return status;
     } else {
-        /* Unknown error, we are dipping */
-        MSG_ERR("[uploader] During curl file upload, System failed to run with exit code %d\n", status);
-        sniffer_exit();
+        /* Unknown curl error, we just skipping */
+        return -1;
     }
+    
+    return 0;
+}
+
+/**
+ * Special function for saving unknown curl responses.
+ * 
+ * @param file_in   String of the file to copy.
+ * @return          -1 on failure, 0 on success
+*/
+static int save_unknown_response (const char* file_in) {
+
+    ssize_t i, j;
+    FILE* fp_in, *fp_out;
+    char bad_file[100];
+
+    sprintf(bad_file, "bad_file_%d.txt", bad_file_count++);
+
+    MSG_WARN("[save_unknown_response] NON-JSON response received, attempting to save as %s\n", bad_file);
+
+    fp_in = fopen(file_in, "r");
+    fp_out = fopen(bad_file, "w");
+
+    if (fp_in == NULL) {
+        MSG_WARN("[save_unknown_response] Failed to open %s for reading. Errno was %d. Skipping copy\n", file_in, errno);
+        return -1;
+    } else if (fp_out == NULL) {
+        MSG_WARN("[save_unknown_response] Failed to open %s for writing\n. Errno was %d. Skipping copy\n", bad_file, errno);
+        return -1;
+    }
+
+    i = fgetc(fp_in);
+
+    do {
+        j = fputc(i, fp_out);
+
+        if (j == EOF) {
+            MSG_WARN("[save_unknown_response] Failed writing to %s\n. Errno was %d. Exiting copy\n", bad_file, errno);
+            return -1;
+        }
+
+        i = fgetc(fp_in);
+    } while (i != EOF);
+
+    i =  fclose(fp_in);
+    if (i == EOF)
+        MSG_WARN("[save_unknown_response] Failed closing %s\n. Errno was %d\n", file_in, errno);
+            
+    i = fclose(fp_out);
+    if (i == EOF)
+        MSG_WARN("[save_unknown_response] Failed closing %s\n. Errno was %d\n", bad_file, errno);
 
     return 0;
 }
 
 /* -------------------------------------------------------------------------- */
-/* --- THREAD 1: RECEIVING PACKETS ------------------------------------------ */
+/* --- THREAD 1.0: RECEIVING PACKETS ------------------------------------------ */
 void thread_listen(void) {
 
     int i; /* loop and temporary variables */
 
     struct timespec sleep_time = {0, 3000000}; /* 3 ms */
-    // struct timespec sleep_time = {0, 5000000000}; /* 5000 ms */
-
-    /* counting variables */
-    unsigned long pkt_in_log = 0;
 
     /* allocate memory for packet fetching and processing */
     struct lgw_pkt_rx_s rxpkt[16]; /* array containing up to 16 inbound packets metadata */
@@ -2029,7 +1834,7 @@ void thread_listen(void) {
         pthread_mutex_unlock(&mx_concent);
         
         if (nb_pkt == LGW_HAL_ERROR) {
-            MSG_ERR("failed packet fetch, exiting\n");
+            MSG_ERR("[listener] failed packet fetch, exiting\n");
             sniffer_exit();
         } else if (nb_pkt == 0) {
             clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
@@ -2041,21 +1846,25 @@ void thread_listen(void) {
                 pkt_encode->rx_pkt = rxpkt[i];
                 STAILQ_INSERT_TAIL(&head, pkt_encode, entries);
             }
-            pkt_in_log += nb_pkt;
+            packets_caught += nb_pkt;
             pthread_mutex_unlock(&mx_report_dev);
         }
     }
 
-    MSG_INFO("Packets caught: %ld\n", pkt_in_log);
-    MSG_INFO("End of listening thread\n");
+    MSG_INFO("[listener] Packets caught: %lu\n", (unsigned long)packets_caught);
+    MSG_INFO("[listener] End of listening thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 1.1: JSON encoding for device packet info --------------------- */
 void thread_encode(void) {
 
-    /* General return variable holder */
+    /* return holder variable */
     int i = 0;
+
+    /* mutex interaction variables and counters */
+    int mutex_current = 0;
+    int ed_reports = 0;
 
     /* sleep managent value */
     struct timespec sleep_time = {0, 3000000}; /* 0 s, 3ms */
@@ -2066,27 +1875,22 @@ void thread_encode(void) {
     /* object for data encoding */
     ed_report_t *report = create_ed_report();
 
-    /* gps handling variables */
-    struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
-    bool gps_ok = false;
-
-    /* timestamp variables until GPS is acquired */
+    /* timestamp variables */
     struct timespec pkt_utc_time;
     struct tm *xt;
 
     while (!exit_sig && !quit_sig) {
 
         pthread_mutex_lock(&mx_report_dev);
-        pthread_mutex_lock(&mx_report_ch);
 
-        if ((STAILQ_EMPTY(&head) == false) && (gps_enabled == true)) {
-            pthread_mutex_lock(&mx_timeref);
-            local_ref = time_reference_gps;
-            gps_ok = gps_ref_valid;
-            pthread_mutex_unlock(&mx_timeref);
-        } else {
-            gps_ok = false;
+        mutex_current = 0; /* reset this, it will change below if necessary */
+        i = pthread_mutex_trylock(&mx_ed_report_0);
+        if (i != 0) {
+            /* unable to get lock from above, lets get the other one */
+            pthread_mutex_lock(&mx_ed_report_1);
+            mutex_current = 1;
         }
+        ed_reports = mutex_current ? ed_reports_1 : ed_reports_0;
 
         pkt_encode = STAILQ_FIRST(&head);
 
@@ -2096,25 +1900,18 @@ void thread_encode(void) {
             reset_ed_report(report);
 
             /* Acquire timestamp data */
-            if (gps_ok) {
-                i = lgw_cnt2utc(local_ref, pkt_encode->rx_pkt.count_us, &pkt_utc_time);
-                if (i != LGW_GPS_SUCCESS) {
-                    MSG_ERR("[encoder] Failed to get GPS time conversion\n");
-                    clock_gettime(CLOCK_REALTIME, &pkt_utc_time);
-                }
-            } else {
-                clock_gettime(CLOCK_REALTIME, &pkt_utc_time);
-            }
+            clock_gettime(CLOCK_REALTIME, &pkt_utc_time);
             xt = gmtime(&(pkt_utc_time.tv_sec));
 
             /* Write to report and encode t device json */
             write_ed_report(report, &pkt_encode->rx_pkt, xt, &pkt_utc_time);
-            encode_ed_report(report, ed_reports++);
+            encode_ed_report(report, mutex_current, ed_reports++);
 
-            MSG_INFO("[encoder] Packet No.%d encoded this period\n", ed_reports);
-
-            /* Update the appropriate channel aggregate info */
-            write_ch_report(report, &pkt_encode->rx_pkt);
+            if (mutex_current == 0) {
+                ed_reports_0++;
+            } else {
+                ed_reports_1++;
+            }
 
             /* traverse STAILQ and cleanup old queue entry */
             pkt_next = STAILQ_NEXT(pkt_encode, entries);
@@ -2122,7 +1919,13 @@ void thread_encode(void) {
             free((void*)pkt_encode);
             pkt_encode = pkt_next;
         }
-        pthread_mutex_unlock(&mx_report_ch);
+
+        if (mutex_current == 0) {
+            pthread_mutex_unlock(&mx_ed_report_0);
+        } else {
+            pthread_mutex_unlock(&mx_ed_report_1);
+        }
+
         pthread_mutex_unlock(&mx_report_dev);
 
         clock_nanosleep(CLOCK_MONOTONIC, 0, &sleep_time, NULL); /* wait a short time if no packets */
@@ -2135,18 +1938,13 @@ void thread_encode(void) {
 /* -------------------------------------------------------------------------- */
 /* --- THREAD 1.11: Channel aggregate encoding and uploading JSONs ---------- */
 void thread_upload(void) {
-
-    /* Time management variables to ensure thread activates at the correct time*/
-    time_t start, current;
-
-    /* Dummy return variable */
-    int success;
-
-    /* Handler variable for temporary outages */
-    int uploads = 0;
-
-    /* Create the channel report to be used */ 
-    create_ch_report();
+    
+    time_t start, current;              /* Time management variables to ensure thread activates at the correct time*/
+    char report_string[100];            /* File for holding file name creation */
+    int success;                        /* Dummy return variables */
+    int uploads = 0;                    /* Handler variable for temporary connection outages */
+    int ed_reports = 0;                 /* Internal ed reports counter */
+    int mutex_current = -1;             /* current mutex index handler */
 
     start = time(NULL);
 
@@ -2157,401 +1955,124 @@ void thread_upload(void) {
 
         /* check if upload interval time has elapsed */
         if (difftime(current, start) > report_interval) {
-            MSG_INFO("[upload] Upload timer expired. Attempting upload...\n");
+            MSG_INFO("[thread_upload] Upload timer expired. Beginning upload...\n");
             /* Acquire channel and log locks */
-            pthread_mutex_lock(&mx_report_ch);
             pthread_mutex_lock(&mx_log);
+
+            /* Need to acquire each uploading mutex and then upload */
+
+            for (int z = 0; z < 2; z++) {
+                /* MUTEX HANDLING */
+                if (mutex_current == -1) {
+                    /* Mutex is not set, choose whichever we can grab first */
+                    success = pthread_mutex_trylock(&mx_ed_report_0);
+                    if (success != 0) {
+                        /* Couldn't get mutex 0, lets go mutex 1 */
+                        success = pthread_mutex_lock(&mx_ed_report_1);
+                        if (success) {
+                            MSG_WARN("[thread_upload] Failed to acquire lock 1 with error after failing to get lock 0 %d?\n", success);
+                            break;
+                        } 
+                        mutex_current = 1;
+                    } else {
+                        /* We got mutex 0, lets set out variables*/
+                        mutex_current = 0;
+                    }
+                } else if (mutex_current == 0) {
+                    /* Time to get mutex 0 */
+                    success = pthread_mutex_lock(&mx_ed_report_0);
+                    if (success) {
+                        MSG_WARN("[thread_upload] Failed to acquire lock 0 with error %d?\n", success);
+                        break;
+                    } 
+                } else if (mutex_current == 1) {
+                    /* Time to get mutex 1 */
+                    success = pthread_mutex_lock(&mx_ed_report_1);
+                    if (success) {
+                        MSG_WARN("[thread_upload] Failed to acquire lock 1 with error %d?\n", success);
+                        break;
+                    } 
+                } else {
+                    MSG_ERR("[thread_upload] Mutex_current incorrectly set... exiting.\n");
+                    sniffer_exit();
+                }
+
+                ed_reports = mutex_current ? ed_reports_1 : ed_reports_0;
+                uploads = mutex_current ? ed_uploads_1 : ed_uploads_0;
+
+                MSG_INFO("[thread_upload] Utilising mutex %d\n", mutex_current);
+
+                MSG_INFO("[thread_upload] Expecting %d reports uploads\n", ed_reports - uploads);
             
-            /* Handle all ED reports generated */
-            for (int i = uploads; i < ed_reports; i++) {
-                create_file_string(JSON_REPORT_ED, i);
+                /* Handle all ED reports generated */
+                for (int i = uploads; i < ed_reports; i++) {
 
-                success = curl_upload_file(report_string);
+                    //MSG_INFO("[debug] Uploading for mutex %d at index %d with uploads %d\n", mutex_current, i, uploads);
 
-                /* Check if there was a special curl return, either a timeout or a connection reestablish*/
-                if (success == -1) {
-                    MSG_WARN("[uploader] Curl timeout occured. Waiting for next period.\n");
-                    break;
-                } else if (success == 1) {
-                    MSG_WARN("[uploader] Curl timeout fixed. Repeating upload attempt.\n");
-                    i--;
-                    continue;
+                    create_file_string(report_string, JSON_REPORT_ED, mutex_current, i);
+
+                    // MSG_INFO("[debug] Generated file string was %s\n", report_string);
+
+                    success = curl_upload_file(report_string);
+
+                    /* Check if there was a special curl return, either a timeout or a connection reestablish*/
+                    if (success == -1) {
+                        MSG_WARN("[thread_upload] Curl timeout occured. Waiting for next period.\n");
+                        break;
+                    } else if (success == 1) {
+                        MSG_WARN("[thread_upload] Curl timeout fixed or new auth acquired. Repeating upload attempt.\n");
+                        i--;
+                        continue;
+                    }
+
+                    /* Remove the file to save space */
+                    success = remove(report_string);
+
+                    if (success) {
+                        MSG_ERR("[thread_upload] Failed to remove file %s\n", report_string);
+                    }
+
+                    /* Increment our upload counter */
+                    uploads++;
                 }
 
-                /* Remove the file to save space */
-                success = remove(report_string);
+                /* Log data to file */
+                MSG_INFO("[thread_upload] Reports encoded: %d, uploaded: %d\n", ed_reports, uploads);
 
-                if (success) {
-                    MSG_ERR("[uploader] Failed to remove file %s\n", report_string);
+                /* reset upload count if all end device reports were uploaded */
+                if (uploads == ed_reports) {
+
+                    /* all data uploaded successfully, lets reset our variables */
+                    uploads = 0;
+
+                    if (!continuous) {
+                        ed_reports_total += ed_reports;
+                        ed_reports = 0;
+                    }
                 }
 
-                /* Increment our upload counter */
-                uploads++;
+                if (mutex_current == 0) {
+                    ed_uploads_0 = uploads;
+                    ed_reports_0 = ed_reports;
+                    pthread_mutex_unlock(&mx_ed_report_0);
+                } else {
+                    ed_uploads_1 = uploads;
+                    ed_reports_1 = ed_reports;
+                    pthread_mutex_unlock(&mx_ed_report_1);
+                }
+
+                mutex_current = mutex_current ? 0 : 1; /* If mutex is currently 0, go to 1, and vice versa */
             }
 
-            /* Log data to file */
-            MSG_INFO("[uploader] ED reports encoded this period: %d\n", ed_reports);
-            MSG_INFO("[uploader] ED reports uploaded this period: %d\n", uploads);
-
-            /* reset upload count if all end device reports were uploaded */
-            if (uploads == ed_reports) {
-
-                /* all data uploaded successfully, lets reset our variables */
-                uploads = 0;
-
-                if (!continuous) {
-                    ed_reports_total += ed_reports;
-                    ch_reports_total += ch_reports;
-                    ed_reports = 0;
-                    ch_reports = 0;
-                }
-
-            }      
-
+            mutex_current = -1; /* Set mutex current variable to its not set state */
+            
             pthread_mutex_unlock(&mx_log);
-            pthread_mutex_unlock(&mx_report_ch);
-
             start = time(NULL);
         }
     }
 
-    MSG_INFO("[uploader] ED reports encoded total: %d\n", ed_reports_total);
-    MSG_INFO("[uploader] CH reports encoded total: %d\n", ch_reports_total);
-
-    destroy_ch_report();
-    MSG_INFO("End of uploading thread\n");
-}
-
-/* -------------------------------------------------------------------------- */
-/* --- THREAD 2: PARSE GPS MESSAGE AND KEEP GATEWAY IN SYNC ----------------- */
-static void gps_process_sync(void) {
-    struct timespec gps_time;
-    struct timespec utc;
-    uint32_t trig_tstamp; /* concentrator timestamp associated with PPM pulse */
-    int i = lgw_gps_get(&utc, &gps_time, NULL, NULL);
-
-    /* get GPS time for synchronization */
-    if (i != LGW_GPS_SUCCESS) {
-        pthread_mutex_lock(&mx_meas_gps);
-        gps_sync_fail++;
-        gps_speak_cnt++;
-        if (gps_speak_cnt == GPS_SYNC_SILENCE) {
-            gps_speak_cnt = 0;
-            MSG_WARN("[gps] could not get GPS time from GPS\n");
-        }
-        pthread_mutex_unlock(&mx_meas_gps);
-        return;
-    }
-
-    /* get timestamp captured on PPM pulse  */
-    pthread_mutex_lock(&mx_concent);
-    i = lgw_get_trigcnt(&trig_tstamp);
-    pthread_mutex_unlock(&mx_concent);
-    if (i != LGW_HAL_SUCCESS) {
-        MSG_WARN("[gps] failed to read concentrator timestamp\n");
-        return;
-    }
-
-    /* try to update time reference with the new GPS time & timestamp */
-    pthread_mutex_lock(&mx_timeref);
-    i = lgw_gps_sync(&time_reference_gps, trig_tstamp, utc, gps_time);
-    pthread_mutex_unlock(&mx_timeref);
-    if (i != LGW_GPS_SUCCESS) {
-        MSG_WARN("[gps] GPS out of sync, keeping previous time reference\n");
-        return;
-    }
-}
-
-static void gps_process_coords(void) {
-    /* position variable */
-    struct coord_s coord;
-    struct coord_s gpserr;
-    int    i = lgw_gps_get(NULL, NULL, &coord, &gpserr);
-
-    /* update gateway coordinates */
-    pthread_mutex_lock(&mx_meas_gps);
-    if (i == LGW_GPS_SUCCESS) {
-        gps_coord_valid = true;
-        meas_gps_coord = coord;
-        meas_gps_err = gpserr;
-        // TODO: report other GPS statistics (typ. signal quality & integrity)
-    } else {
-        gps_coord_valid = false;
-    }
-    pthread_mutex_unlock(&mx_meas_gps);
-}
-
-void thread_gps(void) {
-    /* serial variables */
-    char serial_buff[128]; /* buffer to receive GPS data */
-    ssize_t nb_char;
-    size_t wr_idx = 0;     /* pointer to end of chars in buffer */
-    size_t rd_idx;
-    size_t frame_end_idx;
-    size_t frame_size;
-
-    /* variables for PPM pulse GPS synchronization */
-    enum gps_msg latest_msg; /* keep track of latest NMEA message parsed */
-
-    /* initialize some variables before loop */
-    memset(serial_buff, 0, sizeof serial_buff);
-
-    while (!exit_sig && !quit_sig) {
-        
-        rd_idx = 0;
-        frame_end_idx = 0;
-
-        /* blocking non-canonical read on serial port */
-        nb_char = read(gps_tty_fd, serial_buff + wr_idx, LGW_GPS_MIN_MSG_SIZE);
-        if (nb_char <= 0) {
-            MSG_WARN("[gps] read() returned value %zd\n", nb_char);
-            continue;
-        }
-        wr_idx += (size_t)nb_char;
-
-        /*******************************************
-         * Scan buffer for UBX/NMEA sync chars and *
-         * attempt to decode frame if one is found *
-         *******************************************/
-        while (rd_idx < wr_idx) {
-            frame_size = 0;
-
-            /* Scan buffer for UBX sync char */
-            if (serial_buff[rd_idx] == (char)LGW_GPS_UBX_SYNC_CHAR) {
-
-                /***********************
-                 * Found UBX sync char *
-                 ***********************/
-                latest_msg = lgw_parse_ubx(&serial_buff[rd_idx], (wr_idx - rd_idx), &frame_size);
-
-                if (frame_size > 0) {
-                    if (latest_msg == INCOMPLETE) {
-                        /* UBX header found but frame appears to be missing bytes */
-                        frame_size = 0;
-                    } else if (latest_msg == INVALID) {
-                        /* message header received but message appears to be corrupted */
-                        MSG_WARN("[gps] could not get a valid message from GPS (no time)\n");
-                        frame_size = 0;
-                    } else if (latest_msg == UBX_NAV_TIMEGPS) {
-                        gps_process_sync();
-                    }
-                }
-            } else if (serial_buff[rd_idx] == (char)LGW_GPS_NMEA_SYNC_CHAR) {
-
-                /************************
-                 * Found NMEA sync char *
-                 ************************/
-                /* scan for NMEA end marker (LF = 0x0a) */
-                char* nmea_end_ptr = memchr(&serial_buff[rd_idx],(int)0x0a, (wr_idx - rd_idx));
-
-                if(nmea_end_ptr) {
-                    /* found end marker */
-                    frame_size = nmea_end_ptr - &serial_buff[rd_idx] + 1;
-                    latest_msg = lgw_parse_nmea(&serial_buff[rd_idx], frame_size);
-
-                    if(latest_msg == INVALID || latest_msg == UNKNOWN) {
-                        /* checksum failed */
-                        MSG_WARN("[gps] Failed checksum validation\n");
-                        frame_size = 0;
-                    } else if (latest_msg == NMEA_RMC) { /* Get location from RMC frames */
-                        gps_process_coords();
-                    }
-                }
-            }
-
-            if (frame_size > 0) {
-                /* At this point message is a checksum verified frame
-                   we're processed or ignored. Remove frame from buffer */
-                rd_idx += frame_size;
-                frame_end_idx = rd_idx;
-            } else {
-                rd_idx++;
-            }
-        } /* ...for(rd_idx = 0... */
-
-        if (frame_end_idx) {
-          /* Frames have been processed. Remove bytes to end of last processed frame */
-          memcpy(serial_buff, &serial_buff[frame_end_idx], wr_idx - frame_end_idx);
-          wr_idx -= frame_end_idx;
-        } /* ...for(rd_idx = 0... */
-
-        /* Prevent buffer overflow */
-        if ((sizeof(serial_buff) - wr_idx) < LGW_GPS_MIN_MSG_SIZE) {
-            memcpy(serial_buff, &serial_buff[LGW_GPS_MIN_MSG_SIZE], wr_idx - LGW_GPS_MIN_MSG_SIZE);
-            wr_idx -= LGW_GPS_MIN_MSG_SIZE;
-        }
-    }
-    MSG_INFO("End of GPS thread\n");
-}
-
-/* -------------------------------------------------------------------------- */
-/* --- THREAD 3: CHECK TIME REFERENCE AND CALCULATE XTAL CORRECTION --------- */
-void thread_valid(void) {
-
-    /* GPS reference validation variables */
-    long gps_ref_age = 0;
-    bool ref_valid_local = false;
-    double xtal_err_cpy;
-
-    /* variables for XTAL correction averaging */
-    unsigned init_cpt = 0;
-    double init_acc = 0.0;
-    double x;
-
-    /* main loop task */
-    while (!exit_sig && !quit_sig) {
-
-        /* calculate when the time reference was last updated */
-        pthread_mutex_lock(&mx_timeref);
-        gps_ref_age = (long)difftime(time(NULL), time_reference_gps.systime);
-        if ((gps_ref_age >= 0) && (gps_ref_age <= GPS_REF_MAX_AGE)) {
-            /* time ref is ok, validate and  */
-            gps_ref_valid = true;
-            ref_valid_local = true;
-            xtal_err_cpy = time_reference_gps.xtal_err;
-        } else {
-            /* time ref is too old, invalidate */
-            gps_ref_valid = false;
-            ref_valid_local = false;
-        }
-        pthread_mutex_unlock(&mx_timeref);
-
-        /* manage XTAL correction */
-        if (ref_valid_local == false) {
-            /* couldn't sync, or sync too old -> invalidate XTAL correction */
-            pthread_mutex_lock(&mx_xcorr);
-            xtal_correct_ok = false;
-            xtal_correct = 1.0;
-            pthread_mutex_unlock(&mx_xcorr);
-            init_cpt = 0;
-            init_acc = 0.0;
-        } else {
-            if (init_cpt < XERR_INIT_AVG) {
-                /* initial accumulation */
-                init_acc += xtal_err_cpy;
-                ++init_cpt;
-            } else if (init_cpt == XERR_INIT_AVG) {
-                /* initial average calculation */
-                pthread_mutex_lock(&mx_xcorr);
-                xtal_correct = (double)(XERR_INIT_AVG) / init_acc;
-                xtal_correct_ok = true;
-                pthread_mutex_unlock(&mx_xcorr);
-                ++init_cpt;
-            } else {
-                /* tracking with low-pass filter */
-                x = 1 / xtal_err_cpy;
-                pthread_mutex_lock(&mx_xcorr);
-                xtal_correct = xtal_correct - xtal_correct/XERR_FILT_COEF + x/XERR_FILT_COEF;
-                pthread_mutex_unlock(&mx_xcorr);
-            }
-        }
-    }
-    MSG_INFO("End of validation thread\n");
-}
-
-/* -------------------------------------------------------------------------- */
-/* --- THREAD 4: SPECTRAL SCAN ---------------------------------------------- */
-void thread_spectral_scan(void) {
-    int i, x;
-    uint32_t freq_hz = spectral_scan_params.freq_hz_start;
-    uint32_t freq_hz_stop = spectral_scan_params.freq_hz_start + spectral_scan_params.nb_chan * 200E3;
-    int16_t levels[LGW_SPECTRAL_SCAN_RESULT_SIZE];
-    uint16_t results[LGW_SPECTRAL_SCAN_RESULT_SIZE];
-    struct timeval tm_start;
-    lgw_spectral_scan_status_t status;
-    bool spectral_scan_started = false;
-    bool exit_thread = false;
-
-    /* main loop task */
-    while (!exit_sig && !quit_sig) {
-        /* Pace the scan thread (1 sec min), and avoid waiting several seconds when exit */
-        for (i = 0; i < (int)(spectral_scan_params.pace_s ? spectral_scan_params.pace_s : 1); i++) {
-            if (exit_sig || quit_sig) {
-                exit_thread = true;
-                break;
-            }
-            wait_ms(1000);
-        }
-        if (exit_thread == true) {
-            break;
-        }
-
-        spectral_scan_started = false;
-
-        /* Start spectral scan */
-        pthread_mutex_lock(&mx_concent);
-        x = lgw_spectral_scan_start(freq_hz, spectral_scan_params.nb_scan);
-        if (x != 0) {
-            printf("ERROR: spectral scan start failed\n");
-        }
-        spectral_scan_started = true;
-        pthread_mutex_unlock(&mx_concent);
-
-        if (spectral_scan_started == true) {
-            /* Wait for scan to be completed */
-            status = LGW_SPECTRAL_SCAN_STATUS_UNKNOWN;
-            timeout_start(&tm_start);
-            do {
-                /* handle timeout */
-                if (timeout_check(tm_start, 2000) != 0) {
-                    printf("ERROR: %s: TIMEOUT on Spectral Scan\n", __FUNCTION__);
-                    break;  /* do while */
-                }
-
-                /* get spectral scan status */
-                pthread_mutex_lock(&mx_concent);
-                x = lgw_spectral_scan_get_status(&status);
-                pthread_mutex_unlock(&mx_concent);
-                if (x != 0) {
-                    printf("ERROR: spectral scan status failed\n");
-                    break; /* do while */
-                }
-
-                /* wait a bit before checking status again */
-                wait_ms(10);
-            } while (status != LGW_SPECTRAL_SCAN_STATUS_COMPLETED && status != LGW_SPECTRAL_SCAN_STATUS_ABORTED);
-
-            if (status == LGW_SPECTRAL_SCAN_STATUS_COMPLETED) {
-                /* Get spectral scan results */
-                memset(levels, 0, sizeof levels);
-                memset(results, 0, sizeof results);
-                pthread_mutex_lock(&mx_concent);
-                x = lgw_spectral_scan_get_results(levels, results);
-                pthread_mutex_unlock(&mx_concent);
-                if (x != 0) {
-                    printf("ERROR: spectral scan get results failed\n");
-                    continue; /* main while loop */
-                }
-
-                
-                /* print results */
-                // printf("SPECTRAL SCAN RESULTS - %u Hz: ", freq_hz);
-                // for (i = 0; i < LGW_SPECTRAL_SCAN_RESULT_SIZE; i++) {
-                //     printf("%u ", results[i]);
-                // }
-                // printf("\n");
-
-
-                //TODO : Uncomment above and delete this print loop
-                // printf("SPECTRAL SCAN LEVELS - %u Hz: ", freq_hz);
-                // for (i = 0; i < LGW_SPECTRAL_SCAN_RESULT_SIZE; i++) {
-                //     printf("LEVEL: %u RESULT: %u\n", levels[i], results[i]);
-                // }
-                // printf("\n");
-
-                /* Next frequency to scan */
-                freq_hz += 200000; /* 200kHz channels */
-                if (freq_hz >= freq_hz_stop) {
-                    freq_hz = spectral_scan_params.freq_hz_start;
-                }
-            } else if (status == LGW_SPECTRAL_SCAN_STATUS_ABORTED) {
-                printf("INFO: %s: spectral scan has been aborted\n", __FUNCTION__);
-            } else {
-                printf("ERROR: %s: spectral scan status us unexpected 0x%02X\n", __FUNCTION__, status);
-            }
-        }
-    }
-    printf("\nINFO: End of Spectral Scan thread\n");
+    MSG_INFO("[uploader] ED reports uploaded total: %d\n", ed_reports_total);
+    MSG_INFO("[uploader] End of uploading thread\n");
 }
 
 /* -------------------------------------------------------------------------- */
@@ -2566,6 +2087,9 @@ int main(int argc, char **argv) {
     const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
     const char * conf_fname = defaut_conf_fname; /* pointer to a string we won't touch */
 
+    unsigned sleep_time = 0;
+    uint8_t sleep_counter = 0;
+
     /* deamonise handling variables */
     pid_t pid;
     bool daemonise = false;
@@ -2574,9 +2098,6 @@ int main(int argc, char **argv) {
     pthread_t thrid_listen;
     pthread_t thrid_encode;
     pthread_t thrid_upload;
-    pthread_t thrid_gps;
-    pthread_t thrid_valid;
-    pthread_t thrid_spectral;
 
     /* message queue initialisation */
     STAILQ_INIT(&head);
@@ -2666,19 +2187,8 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    /* Start GPS so it figures itself out quick */
-    if (gps_tty_path[0] != '\0') { /* do not try to open GPS device if no path set */
-        i = lgw_gps_enable(gps_tty_path, "ubx7", 0, &gps_tty_fd); /* HAL only supports u-blox 7 for now */
-        if (i != LGW_GPS_SUCCESS) {
-            MSG_WARN("impossible to open %s for GPS sync (check permissions)\n", gps_tty_path);
-            gps_enabled = false;
-            gps_ref_valid = false;
-        } else {
-            MSG_INFO("TTY port %s open for GPS synchronization\n", gps_tty_path);
-            gps_enabled = true;
-            gps_ref_valid = false;
-        }
-    }
+    /* Set our sleep time */
+    sleep_time = log_interval / stats_per_log;
 
     /* starting the concentrator */
     if (sniffer_start()) {
@@ -2707,29 +2217,6 @@ int main(int argc, char **argv) {
         sniffer_exit();
     }
 
-    /* Spectral scan auxiliary thread */
-    if (spectral_scan_params.enable == true) {
-        i = pthread_create(&thrid_spectral, NULL, (void * (*)(void *))thread_spectral_scan, NULL);
-        if (i != 0) {
-            MSG_ERR("[main] impossible to create Spectral Scan thread\n");
-            sniffer_exit();
-        }
-    }
-
-    /* GPS thread management */
-    if (gps_enabled == true) {
-        i = pthread_create(&thrid_gps, NULL, (void * (*)(void *))thread_gps, NULL);
-        if (i != 0) {
-            MSG_ERR("[main] impossible to create GPS thread\n");
-            sniffer_exit();
-        }
-        i = pthread_create(&thrid_valid, NULL, (void * (*)(void *))thread_valid, NULL);
-        if (i != 0) {
-            MSG_ERR("[main] impossible to create validation thread\n");
-            sniffer_exit();
-        }
-    }
-
     /* configure signal handling */
     sigemptyset(&sigact.sa_mask);
     sigact.sa_flags = 0;
@@ -2740,24 +2227,23 @@ int main(int argc, char **argv) {
 
     while (!exit_sig && !quit_sig) {
         /* Sleep, then create new log once time is up */
-        wait_ms(MS_CONV * log_interval);
+        wait_ms(MS_CONV * sleep_time);
         pthread_mutex_lock(&mx_log);
+        pthread_mutex_lock(&mx_report_dev);
 
         /* close current log and open a new one only if no interrupt signals have been given */
         if (!exit_sig && !quit_sig) {
-            //log_close();
-            log_open();
-
-            create_gw_report(); // Get our lovely gateway info going
-
-            pthread_mutex_lock(&mx_meas_gps);
-            if (gps_sync_fail == GPS_MAX_NO_SYNC) {
-                MSG_WARN("[main] time to reset the GPS\n");
+            if (sleep_counter == stats_per_log) {
+                log_open();
+                sleep_counter = 0;
             }
-            pthread_mutex_unlock(&mx_meas_gps);
             
+
+            generate_sniffer_stats(); // Get our lovely gateway info going
+            sleep_counter++;
         }
         
+        pthread_mutex_unlock(&mx_report_dev);
         pthread_mutex_unlock(&mx_log);
     }
 
@@ -2779,25 +2265,6 @@ int main(int argc, char **argv) {
         MSG_ERR("Failed to join uploading upstream thread with %d - %s\n", i, strerror(errno));
     }
 
-    if (spectral_scan_params.enable == true) {
-        i = pthread_join(thrid_spectral, NULL);
-        if (i != 0) {
-            MSG_ERR("Failed to join Spectral Scan thread with %d - %s\n", i, strerror(errno));
-        }
-    }
-
-    if (gps_enabled == true) {
-        pthread_cancel(thrid_gps); /* don't wait for GPS thread, no access to concentrator board */
-        pthread_cancel(thrid_valid); /* don't wait for validation thread, no access to concentrator board */
-
-        i = lgw_gps_disable(gps_tty_fd);
-        if (i == LGW_HAL_SUCCESS) {
-            MSG_INFO("GPS closed successfully\n");
-        } else {
-            MSG_WARN("failed to close GPS successfully\n");
-        }
-    }
-
     if (exit_sig) {
         /* clean up before leaving */
         sniffer_stop();
@@ -2807,10 +2274,7 @@ int main(int argc, char **argv) {
     /* message queue deinitialisation */
     STAILQ_INIT(&head);
 
-    MSG_INFO("Exiting packet sniffer program\n");
-
-    /* close the log file */
-    //log_close();
+    MSG_INFO("Successfully exited packet sniffer program\n");
 
     return EXIT_SUCCESS;
 }
