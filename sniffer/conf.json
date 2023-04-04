@@ -69,7 +69,7 @@
     "gateway_conf": {
         "gateway_ID": "001",
         /* Reporting interval (in seconds) - currently 5 minutes [300] */
-        "report_interval": 60,
+        "report_interval": 30,
         /* Log generation (in seconds) - currently a day [86400] */  
         "log_interval": 43200, 
         /* number of times statistics are generated within a single log file - currently 4 */

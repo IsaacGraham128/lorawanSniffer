@@ -109,6 +109,8 @@ Maintainer: Sylvain Miermont
 #define JSON_FCNT           "FCnt"
 #define JSON_FREQ           "Freq"
 #define JSON_SF             "SF"
+#define JSON_FPORT          "FPort"
+#define JSON_FRMLEN         "FRMLen"
 
 /* JSON key fields for gateway report information */
 #define JSON_TMP_CPU        "temp_cpu"
@@ -120,6 +122,9 @@ Maintainer: Sylvain Miermont
 #define JSON_DEVADDR_LEN    9           /* Max length of the device address string, including null terminator */
 #define JSON_MTYPE_LEN      4           /* Max length of the message type string, including null terminator */
 #define JSON_CRC_LEN        6           /* Max length of the CRC string, including null terminator */
+#define JSON_FOPT_LEN       10           /* Max length of an Fopt argument, 0x prefix, max 5 bytes, CID and null terminator */
+
+#define MAX_FOPTS_FIELDS    15          /* Maximum number of frame options */
 
 #define MS_CONV             1000        /* conversion define to go from seconds to milliseconds*/
 #define UPLOAD_SLEEP        1           /* sleep time of the upload thread to check if its time to upload */
@@ -143,6 +148,8 @@ Maintainer: Sylvain Miermont
 #define EXTRA_SYNCWORD      4.25        /* Bytes allocated to LoRa transmission synchronisation word */
 #define EXTRA_PHDR          8           /* Bytes allocated to LoRa transmission PHDR and PHDR_CRC */
 #define EXTRA_CRC           2           /* Bytes allocated to LoRa transmission CRC */
+
+#define CID_UNKNOWN         "CID_UNKWN" /* Error string used for an unknown CID*/
 
 /* defines for AUTH0 and HTTP POST curl-ing */
 #define CURL_TARGET_DASH    0
@@ -172,19 +179,30 @@ Maintainer: Sylvain Miermont
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE TYPES -------------------------------------------------------- */
 
-/* end device report */
+/* end device report - structured like a data frame! */
 typedef struct ed_report_s {
+    /* Auxiliary metrics */
     char* timestamp;
-    char* devaddr;
-    char* mtype;
-    char* crc;
     float freq;
     uint8_t sf;
-    uint32_t fcnt;
     float snr;
     float rssi;
     float toa;
+    /* Fields structured like a data frame! */
+    char* mtype;
+    char* devaddr;
     bool adr;
+    bool ack;
+    uint8_t foptslen;
+    uint32_t fcnt;
+    char** fopts;
+    int fport;
+    uint8_t frmlength;
+    char* crc;
+    /* Special JR request items */
+    uint64_t appEUI;
+    uint64_t devEUI;
+    uint8_t size;
 } ed_report_t;
 
 /* struct for holding radio information configuration */
@@ -293,9 +311,10 @@ static float stat_get_temp_lgw (void);
 
 static int stat_get_wlan0_rx_tx (long *rx, long *tx);
 
-float get_ram_value(char* str);
+/* Special functions for caught data frame parsing and handling */
+static int fopts_get_mac_len (uint8_t cid);
 
-float get_cpu_temp (void);
+static int write_cid_ed_report (ed_report_t* report, int index, char* string);
 
 /* End device report writing object handlers */
 static ed_report_t* create_ed_report(void);
@@ -624,6 +643,55 @@ static int stat_get_wlan0_rx_tx (long *rx, long *tx) {
 }
 
 /**
+ * Returns the expected length of the MAC command data fields given some CID. Returns an 
+ * error if the CID provides a value that cannot be handled (i.e. invalid CIDs 0 or 1, RFU,
+ * or proprietary)
+ * 
+ * @param cid   The command identifier
+ * @return      -1 if the CID
+*/
+static int fopts_get_mac_len (uint8_t cid) {
+
+    static const uint8_t mac_len[] = {
+        -1, -1, 2, 4, 1, 4, 2, 5, 1, 1, 5, -1, -1, 5, -1, -1, -1
+    };
+
+    if (cid > 0x80)
+        return -1;
+
+    return mac_len[cid];
+}
+
+/**
+ * Write a CID entry to the ed_report struct.
+ * Allocates space at the given index and copies the string in.
+ * @param report    Report object pointer
+ * @param index     Index to write to
+ * @param string    String to enter
+ * @return          0 on success, -1 otherwise
+*/
+static int write_cid_ed_report (ed_report_t* report, int index, char* string) {
+
+    int ret = 0;
+
+    report->fopts[index] = malloc(sizeof(char) * JSON_FOPT_LEN);
+
+    if (report->fopts[index] == NULL) {
+        MSG_ERR("[write_cid_ed_report] Unable to allocate memory to write CID\n");
+        return -1;
+    }
+
+    ret = sprintf(report->fopts[index], string);
+
+    if (ret < 0) {
+        MSG_ERR("[write_cid_ed_report] Failed to sprintf CID string to e_report\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+/**
  * Create the appropriate string for a JSON file. User can define if the 
  * file is for a channel or device report, as well as its number.
  * 
@@ -654,6 +722,8 @@ static ed_report_t* create_ed_report(void) {
     ed_report->devaddr =        (char*)calloc(JSON_DEVADDR_LEN, sizeof(char));
     ed_report->mtype =          (char*)calloc(JSON_MTYPE_LEN, sizeof(char));
     ed_report->crc =            (char*)calloc(JSON_CRC_LEN, sizeof(char));
+    ed_report->fopts =          (char**)calloc(MAX_FOPTS_FIELDS, sizeof(char*));
+    ed_report->foptslen = 0; // Foptslen on creation MUST be 0
 
     return ed_report;
 }
@@ -672,29 +742,23 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
     /* airtime calculation variable */
     float airtime = 0;
 
-    /* recieved packet variables */
+    /* CID sprintf array */
+    char number[JSON_FOPT_LEN];
+
+    /* recieved packet variables that require a bit of shifting */
+    uint64_t mote_mac_cmd = 0;
     uint32_t mote_addr = 0;
-    uint8_t  mote_mhdr = 0;
+    int mac_len = 0;
+    uint8_t mote_mhdr = 0;
+    uint8_t mote_cid = 0;
+    uint8_t offset = 0;
 
     /* Timestamp */
     sprintf(report->timestamp, "%04i-%02i-%02iT%02i:%02i:%02i.%03liZ",(xt->tm_year)+1900,(xt->tm_mon)+1,xt->tm_mday,xt->tm_hour,xt->tm_min,xt->tm_sec,(fetch_time->tv_nsec)/1000000); /* ISO 8601 format */
+    
     /* MHDR and Message Type */
     mote_mhdr = p->payload[0];
-    mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
-
-    sprintf(report->devaddr, "%.8x", mote_addr);
-
-    switch(mote_mhdr >> 5) {
-        case 0b000 : sprintf(report->mtype, "JR");  break;
-        case 0b001 : sprintf(report->mtype, "JA");  break;
-        case 0b010 : sprintf(report->mtype, "UDU"); break;
-        case 0b011 : sprintf(report->mtype, "UDD"); break;
-        case 0b100 : sprintf(report->mtype, "CDU"); break;
-        case 0b101 : sprintf(report->mtype, "CDD"); break;
-        case 0b110 : sprintf(report->mtype, "RFU"); break;
-        case 0b111 : sprintf(report->mtype, "PRP"); break;
-    }
-
+    
     /* CRC status */
     switch(p->status) {
         case STAT_CRC_OK:       sprintf(report->crc, "OK");     break;
@@ -704,13 +768,13 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
         default:                sprintf(report->crc, "ERR");
     }
 
-    /* General packet statistics - Freq, SF, FCnt, SNR, RSSI, ToA, ADR */
+    /* General packet statistics - Freq, SF, SNR, RSSI, ToA, */
     report->freq = ((double)p->freq_hz / 1e6);
     report->sf = p->datarate;
     report->snr = p->snr;
-    report->fcnt = p->payload[6] | p->payload[7] << 8;
-    report->rssi = -1 * p->rssis;
+    report->rssi = p->rssis;
 
+    /* Time on air calculation */
     airtime = (p->size + EXTRA_PREAMBLE + EXTRA_SYNCWORD + EXTRA_PHDR + EXTRA_CRC) * 8;
     switch (p->datarate) {
         case DR_LORA_SF7:   airtime = airtime / BITRATE_DR5; break;
@@ -721,9 +785,84 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
         case DR_LORA_SF12:  airtime = airtime / BITRATE_DR0; break;
         default:            MSG_ERR("Unknown spreading factor found");
     }
-
     report->toa = airtime * 1e3; // In ms 
+
+    /* Join request case... very important */
+    if (mote_mhdr >> 5 == 0b000) {
+        sprintf(report->mtype, "JR");
+
+        // Special case for JR
+        // First 8 bytes are the APP EUI
+        report->appEUI = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24 | p->payload[5] << 32 | p->payload[6] << 40 | p->payload[7] << 48 | p->payload[8] << 56;
+        // Second 8 bytes are the Dev EUI
+        report->devEUI = p->payload[9] | p->payload[10] << 8 | p->payload[11] << 16 | p->payload[12] << 24 | p->payload[13] << 32 | p->payload[14] << 40 | p->payload[15] << 48 | p->payload[16] << 56;
+        // Then there are 2 DevNonce fields
+        // Uploading this for a check - JR should be (at max) 19 bytes?
+        report->frmlength = p->size;
+        
+        return;
+    }
+
+    switch(mote_mhdr >> 5) {
+        // case 0b000 : sprintf(report->mtype, "JR");  break; // Not used as this results in a different message type
+        // case 0b001 : sprintf(report->mtype, "JA");  break; // Not used as this results in a different message type
+        case 0b010 : sprintf(report->mtype, "UDU"); break;
+        case 0b011 : sprintf(report->mtype, "UDD"); break;
+        case 0b100 : sprintf(report->mtype, "CDU"); break;
+        case 0b101 : sprintf(report->mtype, "CDD"); break;
+        case 0b110 : sprintf(report->mtype, "RFU"); break;
+        case 0b111 : sprintf(report->mtype, "PRP"); break;
+    }
+
+    /* FHDR breakdown - DevAddr, FCtrl, FCnt, FOpts */
+    /* DevAddr */
+    mote_addr = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24;
+    sprintf(report->devaddr, "%.8x", mote_addr);
+
+    /* FCtrl - ADR, ACK, FOptsLen */
     report->adr = (p->payload[5] & 0x80) ? true : false;
+    report->ack = (p->payload[5] & 0x20) ? true : false;
+    report->foptslen = p->payload[5] & 0x0F;
+
+    /* FCnt */
+    report->fcnt = p->payload[6] | p->payload[7] << 8;
+
+    /* FOpts - if any */
+    if (report->foptslen && p->status ==STAT_CRC_OK) {
+        MSG_INFO("Device was %s\n", report->devaddr);
+        MSG_INFO("ADR was %s\n", report->adr ? "TRUE" : "FALSE");
+        MSG_INFO("ACK was %s\n", report->ack ? "TRUE" : "FALSE");
+        MSG_INFO("FOptslen was %d\n", report->foptslen);
+        MSG_INFO("FOPTS were: \n");
+
+        for (int i = 0; i < report->foptslen; i++) {
+
+            mote_cid = p->payload[8 + offset];
+            sprintf(number, "0x%.2x", mote_cid);
+            //DEBUG LINES
+            MSG_INFO("%s\n", number);
+            offset++;
+
+            memset(number, 10, sizeof(char));
+        }
+    } else if (p->status == STAT_CRC_OK && report->ack) {
+        MSG_INFO("I noticed device %s sent an ACK...\n", report->devaddr);
+    }
+
+    /* FPort and Foptslen */
+    report->fport = (p->size == 8 + report->foptslen) ? -1 : p->payload[8 + offset];
+
+    if (report->fport == -1) {
+        report->frmlength = p->size - 8 - report->foptslen; // 8 is (7 FHDR + 1 MHDR)
+    } else {
+        report->frmlength = p->size - 8 - report->foptslen - 1; // 8 is (7 FHDR + 1 MHDR) and 1 is FPORT
+    }
+
+    if (report->foptslen && p->status ==STAT_CRC_OK) {
+        MSG_INFO("FPort was %d\n", report->fport);
+        MSG_INFO("Payload original size was %d and FRM is %d\n", p->size, report->frmlength);
+        MSG_INFO("\n");
+    }
 }
 
 /**
@@ -738,6 +877,11 @@ static void reset_ed_report(ed_report_t* report) {
     memset(report->devaddr, 0, sizeof(char) * JSON_DEVADDR_LEN);
     memset(report->mtype, 0, sizeof(char) * JSON_MTYPE_LEN);
     memset(report->crc, 0, sizeof(char) * JSON_CRC_LEN);
+
+    /* Free the Fopt strings, they may not be needed for the next packet */
+    for (int i = 0; i < report->foptslen; i++) {
+        free((void*)report->fopts[i]);
+    }
 }
 
 /**
@@ -747,10 +891,19 @@ static void reset_ed_report(ed_report_t* report) {
 */
 static void destroy_ed_report(ed_report_t* report) {
 
+    /* Free general strings */
     free((void*)report->timestamp);
     free((void*)report->devaddr);
     free((void*)report->mtype);
     free((void*)report->crc);
+
+    /* Free the Fopt strings and its parent pointer */
+    for (int i = 0; i < report->foptslen; i++) {
+        free((void*)report->fopts[i]);
+    }
+    free((void*)report->fopts);
+
+    /* Free the entire report */
     free((void*)report);
 }
 
@@ -771,10 +924,6 @@ static void encode_ed_report(ed_report_t *info, int index_mutex, int index_file)
 
     create_file_string(report_string, JSON_REPORT_ED, index_mutex, index_file);
 
-    // if (index_mutex == 1) encode_ed_report(info, 69, index_file); // Hello this is my debug line!
-
-    // MSG_INFO("[encode_ed_report] Encoding file %s\n", report_string);
-
     file = fopen(report_string, "w");
 
     root_value = json_value_init_object();
@@ -791,6 +940,8 @@ static void encode_ed_report(ed_report_t *info, int index_mutex, int index_file)
     json_object_set_number(root_object, JSON_RSSI,      info->rssi);
     json_object_set_number(root_object, JSON_TOA,       info->toa);
     json_object_set_boolean(root_object, JSON_ADR,      info->adr);
+    json_object_set_number(root_object, JSON_FPORT,     info->fport);
+    json_object_set_number(root_object, JSON_FRMLEN,    info->frmlength);
     
     serialized_string = json_serialize_to_string(root_value);
     fputs(serialized_string, file);
