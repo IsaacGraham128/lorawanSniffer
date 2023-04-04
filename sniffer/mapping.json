@@ -36,38 +36,59 @@
     "SF": {
       "type": "byte"
     },
-    "StartTime": {
-      "type": "date"
-    },
-    "EndTime": {
-      "type": "date"
-    },
-    "DevSeen": {
+    "ACK" : {
       "type": "short"
     },
-    "Util": {
-      "type": "float"
-    },
-    "MsgTotal": {
+    "FPort" : {
       "type": "short"
     },
-    "MsgUnique": {
+    "FRMLen" : {
       "type": "short"
     },
-    "MsgFailed": {
-      "type": "short"
+    "FOpts0" : {
+      "type": "keyword"
     },
-    "tmp_cpu": {
-      "type": "half_float"
+    "FOpts1" : {
+      "type": "keyword"
     },
-    "tmp_con": {
-      "type": "half_float"
+    "FOpts2" : {
+      "type": "keyword"
     },
-    "ram_totl": {
-      "type": "short"
+    "FOpts3" : {
+      "type": "keyword"
     },
-    "ram_aval": {
-      "type": "short"
+    "FOpts4" : {
+      "type": "keyword"
+    },
+    "FOpts5" : {
+      "type": "keyword"
+    },
+    "FOpts6" : {
+      "type": "keyword"
+    },
+    "FOpts7" : {
+      "type": "keyword"
+    },
+    "FOpts8" : {
+      "type": "keyword"
+    },
+    "FOpts9" : {
+      "type": "keyword"
+    },
+    "FOpts10" : {
+      "type": "keyword"
+    },
+    "FOpts11" : {
+      "type": "keyword"
+    },
+    "FOpts12" : {
+      "type": "keyword"
+    },
+    "FOpts13" : {
+      "type": "keyword"
+    },
+    "FOpts14" : {
+      "type": "keyword"
     }
   }
 }

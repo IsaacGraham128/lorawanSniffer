@@ -23,6 +23,9 @@ sniffer/src/json_test.c
 # Mapping files
 sniffer/mapping.json
 
+# Files for demonstrating at meetings
+sniffer/files_to_show/*
+
 # Output or logging files
 *.log
 sniffer/device*.json
