@@ -111,6 +111,8 @@ Maintainer: Sylvain Miermont
 #define JSON_SF             "SF"
 #define JSON_FPORT          "FPort"
 #define JSON_FRMLEN         "FRMLen"
+#define JSON_APPEUI         "AppEUI"
+#define JSON_DEVEUI         "DevEUI"
 
 /* JSON key fields for gateway report information */
 #define JSON_TMP_CPU        "temp_cpu"
@@ -123,6 +125,9 @@ Maintainer: Sylvain Miermont
 #define JSON_MTYPE_LEN      4           /* Max length of the message type string, including null terminator */
 #define JSON_CRC_LEN        6           /* Max length of the CRC string, including null terminator */
 #define JSON_FOPT_LEN       10           /* Max length of an Fopt argument, 0x prefix, max 5 bytes, CID and null terminator */
+
+#define JSON_JR_DATA_LEN    17          /* Max length for two 64bit hex strings - used for AppEui and DevEui, including terminator */
+
 
 #define MAX_FOPTS_FIELDS    15          /* Maximum number of frame options */
 
@@ -200,8 +205,8 @@ typedef struct ed_report_s {
     uint8_t frmlength;
     char* crc;
     /* Special JR request items */
-    uint64_t appEUI;
-    uint64_t devEUI;
+    char* appEUI;
+    char* devEUI;
     uint8_t size;
 } ed_report_t;
 
@@ -723,8 +728,9 @@ static ed_report_t* create_ed_report(void) {
     ed_report->mtype =          (char*)calloc(JSON_MTYPE_LEN, sizeof(char));
     ed_report->crc =            (char*)calloc(JSON_CRC_LEN, sizeof(char));
     ed_report->fopts =          (char**)calloc(MAX_FOPTS_FIELDS, sizeof(char*));
+    ed_report->appEUI =         (char*)calloc(JSON_JR_DATA_LEN, sizeof(char));
+    ed_report->devEUI =         (char*)calloc(JSON_JR_DATA_LEN, sizeof(char));
     ed_report->foptslen = 0; // Foptslen on creation MUST be 0
-
     return ed_report;
 }
 
@@ -747,6 +753,7 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
 
     /* recieved packet variables that require a bit of shifting */
     uint64_t mote_mac_cmd = 0;
+    uint64_t dev_eui, app_eui;
     uint32_t mote_addr = 0;
     int mac_len = 0;
     uint8_t mote_mhdr = 0;
@@ -789,13 +796,17 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
 
     /* Join request case... very important */
     if (mote_mhdr >> 5 == 0b000) {
+        // Special case for JR
         sprintf(report->mtype, "JR");
 
-        // Special case for JR
         // First 8 bytes are the APP EUI
-        report->appEUI = p->payload[1] | p->payload[2] << 8 | p->payload[3] << 16 | p->payload[4] << 24 | p->payload[5] << 32 | p->payload[6] << 40 | p->payload[7] << 48 | p->payload[8] << 56;
+        app_eui = (uint64_t)p->payload[1] | (uint64_t)p->payload[2] << 8 | (uint64_t)p->payload[3] << 16 | (uint64_t)p->payload[4] << 24 | (uint64_t)p->payload[5] << 32 | (uint64_t)p->payload[6] << 40 | (uint64_t)p->payload[7] << 48 | (uint64_t)p->payload[8] << 56;
+        sprintf(report->appEUI, "%.16llx", app_eui);
+        
         // Second 8 bytes are the Dev EUI
-        report->devEUI = p->payload[9] | p->payload[10] << 8 | p->payload[11] << 16 | p->payload[12] << 24 | p->payload[13] << 32 | p->payload[14] << 40 | p->payload[15] << 48 | p->payload[16] << 56;
+        dev_eui = (uint64_t)p->payload[9] | (uint64_t)p->payload[10] << 8 | (uint64_t)p->payload[11] << 16 | (uint64_t)p->payload[12] << 24 | (uint64_t)p->payload[13] << 32 | (uint64_t)p->payload[14] << 40 | (uint64_t)p->payload[15] << 48 | (uint64_t)p->payload[16] << 56;
+        sprintf(report->devEUI, "%.16llx", dev_eui);
+
         // Then there are 2 DevNonce fields
         // Uploading this for a check - JR should be (at max) 19 bytes?
         report->frmlength = p->size;
@@ -877,6 +888,8 @@ static void reset_ed_report(ed_report_t* report) {
     memset(report->devaddr, 0, sizeof(char) * JSON_DEVADDR_LEN);
     memset(report->mtype, 0, sizeof(char) * JSON_MTYPE_LEN);
     memset(report->crc, 0, sizeof(char) * JSON_CRC_LEN);
+    memset(report->appEUI, 0, sizeof(char) * JSON_JR_DATA_LEN);
+    memset(report->devEUI, 0, sizeof(char) * JSON_JR_DATA_LEN);
 
     /* Free the Fopt strings, they may not be needed for the next packet */
     for (int i = 0; i < report->foptslen; i++) {
@@ -896,6 +909,8 @@ static void destroy_ed_report(ed_report_t* report) {
     free((void*)report->devaddr);
     free((void*)report->mtype);
     free((void*)report->crc);
+    free((void*)report->appEUI);
+    free((void*)report->devEUI);
 
     /* Free the Fopt strings and its parent pointer */
     for (int i = 0; i < report->foptslen; i++) {
@@ -928,21 +943,30 @@ static void encode_ed_report(ed_report_t *info, int index_mutex, int index_file)
 
     root_value = json_value_init_object();
     root_object = json_value_get_object(root_value);
+    // Write the consistent fields first
     json_object_set_string(root_object, JSON_TIME,      info->timestamp);
     json_object_set_string(root_object, JSON_TYPE,      JSON_REPORT_ED);
-    json_object_set_string(root_object, JSON_DEVADDR,   info->devaddr);
+    
     json_object_set_string(root_object, JSON_MTYPE,     info->mtype);
     json_object_set_string(root_object, JSON_CRC,       info->crc);
     json_object_set_number(root_object, JSON_FREQ,      info->freq);
     json_object_set_number(root_object, JSON_SF,        info->sf);
-    json_object_set_number(root_object, JSON_FCNT,      info->fcnt);
-    json_object_set_number(root_object, JSON_SNR,       info->snr);
     json_object_set_number(root_object, JSON_RSSI,      info->rssi);
     json_object_set_number(root_object, JSON_TOA,       info->toa);
-    json_object_set_boolean(root_object, JSON_ADR,      info->adr);
-    json_object_set_number(root_object, JSON_FPORT,     info->fport);
     json_object_set_number(root_object, JSON_FRMLEN,    info->frmlength);
-    
+    json_object_set_number(root_object, JSON_SNR,       info->snr);
+
+    // If the message type is a JR
+    if (!strcmp("JR", info->mtype)) {
+        json_object_set_string(root_object, JSON_MTYPE,     info->mtype);
+        json_object_set_string(root_object, JSON_CRC,       info->crc);
+    } else {
+        // If the message type is other
+        json_object_set_number(root_object, JSON_FCNT,      info->fcnt);
+        json_object_set_string(root_object, JSON_DEVADDR,   info->devaddr);
+        json_object_set_boolean(root_object, JSON_ADR,      info->adr);
+        json_object_set_number(root_object, JSON_FPORT,     info->fport);
+    }
     serialized_string = json_serialize_to_string(root_value);
     fputs(serialized_string, file);
 
