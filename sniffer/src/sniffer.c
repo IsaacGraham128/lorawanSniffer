@@ -111,14 +111,14 @@ Maintainer: Sylvain Miermont
 #define JSON_SF             "SF"
 #define JSON_FPORT          "FPort"
 #define JSON_FRMLEN         "FRMLen"
-#define JSON_APPEUI         "AppEUI"
-#define JSON_DEVEUI         "DevEUI"
+#define JSON_APPEUI         "AppEui"
+#define JSON_DEVEUI         "DevEui"
 
 /* JSON key fields for gateway report information */
 #define JSON_TMP_CPU        "temp_cpu"
 #define JSON_TMP_CON        "temp_con"
 #define JSON_RAM_TOTL       "ram_totl"
-#define JSON_RAM_AVAL       "ram_aval"  
+#define JSON_RAM_AVAL       "ram_aval"
 
 #define JSON_TIME_LEN       80          /* Max length of the timestamp string, including null terminator */
 #define JSON_DEVADDR_LEN    9           /* Max length of the device address string, including null terminator */
