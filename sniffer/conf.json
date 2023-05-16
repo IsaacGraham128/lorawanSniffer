@@ -96,6 +96,6 @@
         /* Auth0 domain url */
         "client_domain": "https://sdl-api.au.auth0.com/oauth/token",
         /* dashboard endpoint url */
-        "dashboard_url": "https://socialdiscoverylab.com/API/sniffer/isaac_house"
+        "dashboard_url": "https://socialdiscoverylab.com/API/sniffer/uq_gps"
     }
 }

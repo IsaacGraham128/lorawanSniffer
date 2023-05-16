@@ -171,7 +171,7 @@ Maintainer: Sylvain Miermont
 #define CURL_ERRORS_MAX     10
 
 #define CURL_OUTPUT         "out.json"
-#define CURL_PREFIX         "curl --connect-timeout 15 -o out.json -s -H \"Content-Type: application/json\""
+#define CURL_PREFIX         "curl --connect-timeout 15 -o out.json -s -H \"Content-Type:application/json\""
 #define CURL_TEST           "curl --connect-timeout 15 -s"
 
 /* curl errors we actively deal with */
@@ -839,26 +839,26 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
     report->fcnt = p->payload[6] | p->payload[7] << 8;
 
     /* FOpts - if any */
-    if (report->foptslen && p->status ==STAT_CRC_OK) {
-        MSG_INFO("Device was %s\n", report->devaddr);
-        MSG_INFO("ADR was %s\n", report->adr ? "TRUE" : "FALSE");
-        MSG_INFO("ACK was %s\n", report->ack ? "TRUE" : "FALSE");
-        MSG_INFO("FOptslen was %d\n", report->foptslen);
-        MSG_INFO("FOPTS were: \n");
+    // if (report->foptslen && p->status ==STAT_CRC_OK) {
+    //     MSG_INFO("Device was %s\n", report->devaddr);
+    //     MSG_INFO("ADR was %s\n", report->adr ? "TRUE" : "FALSE");
+    //     MSG_INFO("ACK was %s\n", report->ack ? "TRUE" : "FALSE");
+    //     MSG_INFO("FOptslen was %d\n", report->foptslen);
+    //     MSG_INFO("FOPTS were: \n");
 
-        for (int i = 0; i < report->foptslen; i++) {
+    //     for (int i = 0; i < report->foptslen; i++) {
 
-            mote_cid = p->payload[8 + offset];
-            sprintf(number, "0x%.2x", mote_cid);
-            //DEBUG LINES
-            MSG_INFO("%s\n", number);
-            offset++;
+    //         mote_cid = p->payload[8 + offset];
+    //         sprintf(number, "0x%.2x", mote_cid);
+    //         //DEBUG LINES
+    //         MSG_INFO("%s\n", number);
+    //         offset++;
 
-            memset(number, 10, sizeof(char));
-        }
-    } else if (p->status == STAT_CRC_OK && report->ack) {
-        MSG_INFO("I noticed device %s sent an ACK...\n", report->devaddr);
-    }
+    //         memset(number, 10, sizeof(char));
+    //     }
+    // } else if (p->status == STAT_CRC_OK && report->ack) {
+    //     MSG_INFO("I noticed device %s sent an ACK...\n", report->devaddr);
+    // }
 
     /* FPort and Foptslen */
     report->fport = (p->size == 8 + report->foptslen) ? -1 : p->payload[8 + offset];
@@ -869,11 +869,11 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
         report->frmlength = p->size - 8 - report->foptslen - 1; // 8 is (7 FHDR + 1 MHDR) and 1 is FPORT
     }
 
-    if (report->foptslen && p->status ==STAT_CRC_OK) {
-        MSG_INFO("FPort was %d\n", report->fport);
-        MSG_INFO("Payload original size was %d and FRM is %d\n", p->size, report->frmlength);
-        MSG_INFO("\n");
-    }
+    // if (report->foptslen && p->status ==STAT_CRC_OK) {
+    //     MSG_INFO("FPort was %d\n", report->fport);
+    //     MSG_INFO("Payload original size was %d and FRM is %d\n", p->size, report->frmlength);
+    //     MSG_INFO("\n");
+    // }
 }
 
 /**

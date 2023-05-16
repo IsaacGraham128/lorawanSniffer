@@ -6,7 +6,11 @@
 
 # Start the openVPN client daemon
 #sudo openvpn --config /etc/openvpn/sniffer.ovpn &
-#echo "OpenVPN client started"
+echo "Reseting OpenVPN client"
+sudo ifconfig tun0 down
+sudo ifconfig tun0 up
+
+
 
 # Start the script
 ./sniffer -d > always4.log
