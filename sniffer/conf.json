@@ -4,7 +4,7 @@
         "com_path": "/dev/spidev0.0", /* For RAK5146 /dev/ttyACM0, for 2287 /dev/spidev0.0 */
         "lorawan_public": true,
         "clksrc": 0,
-        "antenna_gain": 0, /* antenna gain, in dBi */
+        "antenna_gain": 5, /* antenna gain, in dBi */
         "full_duplex": false,
         "fine_timestamp": {
             "enable": false,
@@ -68,7 +68,7 @@
 
     "gateway_conf": {
         "gateway_ID": "001",
-        /* Reporting interval (in seconds) - currently 5 minutes [300] */
+        /* Reporting interval (in seconds) - currently 30 seconds [30] */
         "report_interval": 30,
         /* Log generation (in seconds) - currently a day [86400] */  
         "log_interval": 43200, 

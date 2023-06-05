@@ -168,7 +168,8 @@ Maintainer: Sylvain Miermont
 
 #define CURL_TIMEOUT_MIN    3
 #define CURL_TIMEOUT_MAX    5
-#define CURL_ERRORS_MAX     10
+#define CURL_ERRORS_MIN     3
+#define CURL_ERRORS_MAX     7
 
 #define CURL_OUTPUT         "out.json"
 #define CURL_PREFIX         "curl --connect-timeout 15 -o out.json -s -H \"Content-Type:application/json\""
@@ -777,6 +778,9 @@ static void write_ed_report(ed_report_t* report, struct lgw_pkt_rx_s *p, struct 
 
     /* General packet statistics - Freq, SF, SNR, RSSI, ToA, */
     report->freq = ((double)p->freq_hz / 1e6);
+
+    
+
     report->sf = p->datarate;
     report->snr = p->snr;
     report->rssi = p->rssis;
@@ -1674,6 +1678,7 @@ static void log_open (void) {
 */
 static int curl_read_system (int system_output) {
 
+    int status;
     int curl_output = system_output >> CURL_SYS_SHIFT; // Get only 8 bits
 
     /* Check if the curl error code was something weird we can't handle */
@@ -1682,6 +1687,26 @@ static int curl_read_system (int system_output) {
         MSG_WARN("[uploader] Curl code %d (system return code %d)\n", curl_output, system_output);
 
         curl_failures++;
+
+        if (curl_failures == CURL_ERRORS_MIN) {
+            MSG_INFO("[uploader] Minimum curl failures hit. Closing and reopening VPN tun0\n");
+
+            status = system("sudo ifconfig tun0 down");
+
+            if (status) {
+                MSG_ERR("[uploader] Failed to close ifconfig tun0\n");
+                MSG_ERR("[uploader] Errno was %d\n", errno);
+                sniffer_exit();
+            }
+
+            status = system("sudo ifconfig tun0 up");
+
+            if (status) {
+                MSG_ERR("[uploader] Failed to reopen ifconfig tun0\n");
+                MSG_ERR("[uploader] Errno was %d\n", errno);
+                sniffer_exit();
+        }
+        }
 
         /* Check if the curl has failed too many times sequentially */
         if (curl_failures > CURL_ERRORS_MAX) {
