@@ -1,16 +1,25 @@
 /*
- / _____)             _              | |
-( (____  _____ ____ _| |_ _____  ____| |__
- \____ \| ___ |    (_   _) ___ |/ ___)  _ \
- _____) ) ____| | | || |_| ____( (___| | | |
-(______/|_____)_|_|_| \__)_____)\____)_| |_|
-  (C)2013 Semtech-Cycleo
+MIT License
 
-Description:
-    Configure LoRa concentrator and record received packets in a log file
+Copyright (c) 2022 IsaacGraham128
 
-License: Revised BSD License, see LICENSE.TXT file include in the project
-Maintainer: Sylvain Miermont
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 */
 
 
@@ -48,9 +57,10 @@ Maintainer: Sylvain Miermont
 #include "loragw_aux.h"
 #include "loragw_gps.h"
 
-/* Includes for client functionality */
-#include <arpa/inet.h>
+/* Includes for server functionality */
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <asm-generic/socket.h>
 
 /* -------------------------------------------------------------------------- */
 /* --- PRIVATE MACROS ------------------------------------------------------- */
@@ -64,12 +74,14 @@ Maintainer: Sylvain Miermont
 #define MSG_LOG(format, ...)    print_log("LOG: " format __VA_OPT__(,) __VA_ARGS__)
 
 /* Logging macro function */
+/* Modified to match kibana visualisation style */
 #define print_log(format, ...) {                                                                    \
     int i = 0;                                                                                      \
+    char time_str[40] = {'\0'};                                                                     \
     log_file = fopen(log_file_name, "a");                                                           \
-    time_t ltime = time(NULL);                                                                      \
-    char *time_str = ctime(&ltime);                                                                 \
-    time_str[strlen(time_str)-1] = '\0';                                                            \
+    struct timespec local_time;                                                                     \
+    clock_gettime(CLOCK_REALTIME, &local_time);                                                     \
+    strftime(time_str, ARRAY_SIZE(time_str),"%b %d, %Y @ %H:%M:%S", localtime(&local_time.tv_sec)); \
     if (verbose) {                                                                                  \
         fprintf(stdout, format __VA_OPT__(,) __VA_ARGS__);                                          \
     }                                                                                               \
@@ -102,9 +114,19 @@ typedef struct spectral_scan_s {
 
 #define OPTION_ARGS         ":acdhv"
 
-#define JSON_CONF_DEFAULT   "conf_client.json"
+#define JSON_CONF_DEFAULT   "conf_server.json"
 
-#define PORT                8000
+#define PORT                    8000
+
+#define BITS_PREAMBLE_N_SYNC    98
+#define BITS_PHDR_N_CRC         64
+
+#define BITRATE_DR0             250         /* Bitrate(bit/sec) for SF12@125KHz*/
+#define BITRATE_DR1             440         /* Bitrate(bit/sec) for SF11@125KHz*/
+#define BITRATE_DR2             980         /* Bitrate(bit/sec) for SF10@125KHz*/
+#define BITRATE_DR3             1760        /* Bitrate(bit/sec) for SF9@125KHz*/
+#define BITRATE_DR4             3125        /* Bitrate(bit/sec) for SF8@125KHz*/
+#define BITRATE_DR5             5470        /* Bitrate(bit/sec) for SF7@125KHz*/
 
 /* signal handling variables */
 struct sigaction sigact; /* SIGQUIT&SIGINT&SIGTERM signal handling */
@@ -956,11 +978,11 @@ static int parse_SX130x_configuration(const char * conf_file) {
 */
 static void log_open (char* file_name) {
 
-    struct timespec now_utc_time;
+    struct timespec local_time;
     char iso_date[40];
     
-    clock_gettime(CLOCK_REALTIME, &now_utc_time);
-    strftime(iso_date, ARRAY_SIZE(iso_date),"%Y%m%dT%H%M%SZ", gmtime(&now_utc_time.tv_sec)); /* format yyyymmddThhmmssZ */
+    clock_gettime(CLOCK_REALTIME, &local_time);
+    strftime(iso_date, ARRAY_SIZE(iso_date),"%Y%m%dT%H%M%SZ", localtime(&local_time.tv_sec)); /* format yyyymmddThhmmssZ */
 
     sprintf(log_file_name, "%s.txt", file_name);
     log_file = fopen(log_file_name, "w"); /* create log file to check if its possible */
@@ -1073,41 +1095,282 @@ void experiment_offered_load(uint16_t max_ppm, uint8_t scaler, uint16_t test_dur
         MSG_INFO("Ending Packets Per Minute (PPM) at %d test\n", packets_per_minute);
         wait_ms(ms_per_minute); // Waiting 1 minute to seperate our times
     }
-
-    
 }
 
 /**
- * Test function that allows the second radio to function as its own stinker.
- * Need to specify commands for more customisation, otherwise this just activates.
- * 
- * Send the following command to leave the function
- * {'e', 'x', 'i', 't', '\0'}
+ * Function for selective jamming operations. Select the part of a LoRaWAN packet to jam.
+ * @param frame_selection   Frame part to jam (0 - Preamble & Sync, 1 - PHDR & CRC, 2 - FRMPayload, 3- final CRC)
+ * @param pkt               Pointer to the packet object to send
+ * @param socket            Socket file descriptor for the client connection
+ * @param tx_power          Transmission power to be used by the second (jamming radio)
 */
-void test_stinker_jammer_solo(int socket) {
+void jamming_selective(struct lgw_pkt_tx_s *ref_pkt, uint8_t frame_section, int socket, int8_t attempts) {
 
-    /* Socket timeout variable */
-    struct timeval timeout;
-
-    /* Packet transmission variable */
     struct lgw_pkt_tx_s pkt;
-    uint16_t fcnt = 0;
+    int ret;
+    float ms_time_to_wait = 0;
+    float bitrate = 0;
+    char buffer_fcnt[5] = {'F', 'C', 'T', 0, 0};
+    uint8_t fcnt = 0;
 
-    /* Socket read variables */
-    int valread;
-    char buffer[5] = { 0 };
+    /* copy memory details into the new struct */
+    memcpy((void*)&pkt, (void*)ref_pkt, sizeof(struct lgw_pkt_tx_s));
 
-    /* Return checking variable */
-    int i;
+    // Do the packet stuff - setting MHDR
+    pkt.payload[0] = 0xE0; // MHDR - Set as PRP
+    pkt.payload[1] = 0x12; // FHDR - DevAddr[0] 
+    pkt.payload[2] = 0x34; // FHDR - DevAddr[1] 
+    pkt.payload[3] = 0x56; // FHDR - DevAddr[2]
+    pkt.payload[4] = 0x78; // FHDR - DevAddr[3]
+    pkt.payload[5] = 0xA0; // FCtrl - set as an ACK and ADR
+    pkt.payload[6] = 0x00; // FCnt[0]
+    pkt.payload[7] = 0x00; // FCnt[1]
+    pkt.payload[8] = 0x69; // Funny number FPort
 
-    timeout.tv_usec = 1000; // 1ms timeout
-
-    if(setsockopt(socket, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout))) {
-        MSG_ERR("Unable to set socket timeout. Exiting\n");
+    /* Get our datarate (bits/sec)*/
+    switch(pkt.datarate) {
+        case DR_LORA_SF7:   bitrate = BITRATE_DR5; break;
+        case DR_LORA_SF8:   bitrate = BITRATE_DR4; break;
+        case DR_LORA_SF9:   bitrate = BITRATE_DR3; break;
+        case DR_LORA_SF10:  bitrate = BITRATE_DR2; break;
+        case DR_LORA_SF11:  bitrate = BITRATE_DR1; break;
+        case DR_LORA_SF12:  bitrate = BITRATE_DR0; break;
+        default:            MSG_ERR("Unknown spreading factor found");
     }
 
+    /* Make our time to wait */
+    switch(frame_section) {
+        case 0 :
+            //MSG_INFO("Transmission will interrupt the Preamble and Sync Word.\n");
+            ms_time_to_wait = 0;
+            break;
+        case 1 :
+            //MSG_INFO("Transmission will interrupt the PHDR and CRC.\n");
+            ms_time_to_wait = (BITS_PREAMBLE_N_SYNC / bitrate) * 1e3;
+            ms_time_to_wait = (BITS_PHDR_N_CRC / bitrate) * 1e3;
+            break;
+        case 2 :
+            //MSG_INFO("Transmission will interrupt the FRMPayload.\n");
+            ms_time_to_wait = (BITS_PREAMBLE_N_SYNC / bitrate) * 1e3;
+            ms_time_to_wait += (BITS_PHDR_N_CRC / bitrate) * 1e3;
+            break;
+        case 3 :
+            //MSG_INFO("Transmission will interrupt the final CRC.\n");
+            ms_time_to_wait = (BITS_PREAMBLE_N_SYNC / bitrate) * 1e3;
+            ms_time_to_wait += (BITS_PHDR_N_CRC / bitrate) * 1e3;
+            ms_time_to_wait = (255 * 8 / bitrate) * 1e3; // 255 is the size of the second radio
+            break;
+        default: 
+            MSG_ERR("Bad frame section selected. Exiting function");
+            return;
+    }
+
+    for (int i = 0; i < attempts; i++) {
+        /* Set initial FCnt to 1*/
+        fcnt++;
+        pkt.payload[6] = fcnt & 0x00FF; // FCnt[0]
+        buffer_fcnt[3] = pkt.payload[6];
+        pkt.payload[7] = fcnt >> 8;     // FCnt[1]
+        buffer_fcnt[4] = pkt.payload[7];
+
+        send(socket, buffer_fcnt, sizeof(buffer_fcnt), 0);  
+
+        /* Send the interrupt message */
+        if (ms_time_to_wait != 0)
+            wait_ms((unsigned long)ms_time_to_wait);
+        ret = lgw_send(&pkt);
+        if (ret != LGW_HAL_SUCCESS) {
+            MSG_ERR("Failed to transmit packet.\n")
+        } else {
+            // Do nothing
+        }  
+
+        /* Wait before sending another message */
+        wait_ms(500 - ms_time_to_wait);
+    }
+
+    MSG_INFO("Selective jam complete. %d packets sent\n", fcnt);
+}
+
+/**
+ * Jammer_pkt_size must be 8 or greater to account for the MACPayload header data.
+*/
+void jamming_scaling (struct lgw_pkt_tx_s *ref_pkt, int socket, int jammer_pkt_size, long test_duration_secs, long jammer_spacing_ms, long desired_spacing_ms, uint16_t* fcnt_jam, uint16_t* fcnt_des) {
+
+    struct lgw_pkt_tx_s pkt;
+    struct timespec start_time, end_time;
+    long run_time, time_diff, radio_jammer_ms, radio_desired_ms;
+    float airtime;
+    uint64_t transmitted_jammer = 0;
+    uint64_t transmitted_desired = 0;
+    int i;
+    uint16_t fcnt = *fcnt_jam;
+    uint16_t fcnt_client = *fcnt_des;
+    uint8_t tx_status;
+    char buffer_fcnt[] = {'F', 'C', 'T', 0, 0};
+
+    /* copy memory details into the new struct */
+    memcpy((void*)&pkt, (void*)ref_pkt, sizeof(struct lgw_pkt_tx_s));
+
+    // Do the packet stuff - setting MHDR
+    pkt.payload[0] = 0xE0; // MHDR - Set as PRP
+    pkt.payload[1] = 0x12; // FHDR - DevAddr[0] 
+    pkt.payload[2] = 0x34; // FHDR - DevAddr[1] 
+    pkt.payload[3] = 0x56; // FHDR - DevAddr[2]
+    pkt.payload[4] = 0x78; // FHDR - DevAddr[3]
+    pkt.payload[5] = 0xA0; // FCtrl - set as an ACK and ADR
+    pkt.payload[6] = 0x00; // FCnt[0]
+    pkt.payload[7] = 0x00; // FCnt[1]
+    pkt.payload[8] = 0x69; // Funny number FPort
+
+    for (int i = 9; i < jammer_pkt_size; i++)
+        pkt.payload[i] = i;
+
+    /* Get our datarate (bits/sec)*/
+    airtime = (pkt.size + 8 + 4.25 + 8 + 2) * 8;
+    switch (pkt.datarate) {
+        case DR_LORA_SF7:   airtime = airtime / BITRATE_DR5; break;
+        case DR_LORA_SF8:   airtime = airtime / BITRATE_DR4; break;
+        case DR_LORA_SF9:   airtime = airtime / BITRATE_DR3; break;
+        case DR_LORA_SF10:  airtime = airtime / BITRATE_DR2; break;
+        case DR_LORA_SF11:  airtime = airtime / BITRATE_DR1; break;
+        case DR_LORA_SF12:  airtime = airtime / BITRATE_DR0; break;
+        default:            MSG_ERR("Unknown spreading factor found");
+    }
+
+    run_time = 0;
+    radio_desired_ms = desired_spacing_ms;
+    radio_jammer_ms = radio_desired_ms / 2;
+
+    while((run_time < test_duration_secs) && (!exit_sig && !quit_sig)) {
+
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
+
+        if (radio_desired_ms >= desired_spacing_ms) {
+            /* Load data and send it */
+            buffer_fcnt[3] = fcnt_client & 0x00FF;
+            buffer_fcnt[4] = fcnt_client >> 8;
+            send(socket, buffer_fcnt, sizeof(buffer_fcnt), 0);
+
+            /* Update our counters */
+            fcnt_client++;
+            transmitted_desired++;
+            radio_desired_ms = 0; /* Reset for next send */
+        }
+
+        if (radio_jammer_ms >= jammer_spacing_ms) {
+            i = lgw_status(0, 1, &tx_status); // Check radio 0
+            if (i == LGW_HAL_ERROR) {
+                MSG_ERR("lgw_status failed with code %d\n", tx_status);
+            } else {
+                if (tx_status == TX_FREE) {
+                    // Update frame counter and send!
+                    pkt.payload[6] = fcnt & 0x00FF;
+                    pkt.payload[7] = fcnt >> 8;
+
+                    i = lgw_send(&pkt);
+                    if (i != LGW_HAL_SUCCESS) {
+                        MSG_ERR("failed to send for some reason\n");
+                    } else {
+                        /* Update our counters */
+                        transmitted_jammer++;
+                        fcnt++;
+                        radio_jammer_ms = 0; // Reset for next send
+                    }
+                }
+            }
+        }
+
+        wait_ms(10);
+
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        time_diff = (end_time.tv_sec - start_time.tv_sec) * 1e3 + (end_time.tv_nsec - start_time.tv_nsec)/ 1e6;
+        radio_jammer_ms += time_diff;
+        radio_desired_ms += time_diff;
+        run_time += end_time.tv_sec - start_time.tv_sec;
+
+    }
+
+    if (exit_sig || quit_sig) // Code to exit
+        return; // Return to exit this function immediately, shutdown will be handled in main
+
+    /* Log message for transmission count - for debugging help */
+    MSG_INFO("Scaling jam complete (Packets Sent: Jammer [%llu], Desired [%llu])\n", transmitted_jammer, transmitted_desired);
+
+    /* Set fcnt values that are passed back */
+    *fcnt_jam = fcnt;
+    *fcnt_des = fcnt_client;
+}
+
+/**
+ * Utility cleanup function should a SIGSTOP or SIGINT be recieved.
+ * Attempts to close any sockets, stop the concentrator card, log the exit,
+ * and return EXIT_SUCCESS
+ * @param socket    Socket to close
+ * @param server_fd Integer of the file descriptor to shutdown
+*/
+void interrupt_cleanup (int socket, int server_fd) {
+
+    char* exit_str = "exit";
+
+    send(socket, exit_str, strlen(exit_str), 0);
+
+    /* close the client socket */ 
+    close(socket);
+
+    /* closing the server socket */ 
+    shutdown(server_fd, SHUT_RDWR);
+
+    sniffer_stop();
+    MSG_INFO("Successfully exited our packet stinker program\n");
+
+    exit(EXIT_SUCCESS);
+}
+
+/* -------------------------------------------------------------------------- */
+/* --- MAIN FUNCTION -------------------------------------------------------- */
+
+int main(int argc, char **argv) {
+
+    /* Socket related variables */
+    int server_fd, new_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    int opt = 1;
+    char buffer_tx[5] =     {'T', 'X', 0, 0, 0};
+
+    /* return management variable */
+    int i;
+
+    /* configuration file related */
+    const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
+    const char * conf_fname = defaut_conf_fname; /* pointer to a string we won't touch */
+
+    /* deamonise handling variables */
+    pid_t pid;
+    bool daemonise = false;
+    uint16_t fcnt = 1;
+    uint16_t fcnt_client = 1;
+
+    char file_helper[50];
+
+    /* variables for managing the functions below lol */
+    uint16_t packets_per_minute = 1;
+    uint8_t scaler = 2;
+    long test_duration_secs = 60; //Currently 3mins per test
+    unsigned long ms_per_minute = 60000;
+    long int wait_time_ms = 0;
+    float airtime = 0;
+    long int packet_airtime_ms;
+
+
+    /* transmitting packet */
+    struct lgw_pkt_tx_s pkt;
+
+    /* Transmission parameters */
     pkt.freq_hz = 916800000;
     pkt.tx_mode = 0; // Send transmission immediately
+    // pkt.count_us = 0; // No delay or timestamp - might not need this
     pkt.rf_chain = 0; // Radio 0 - its the only one with transmissions enabled
     pkt.rf_power = 12;
     pkt.modulation = MOD_LORA;
@@ -1119,65 +1382,7 @@ void test_stinker_jammer_solo(int socket) {
     pkt.preamble = 8; // Standard LoRa preamble for SF7-12
     pkt.no_crc = false;
     pkt.no_header = false;
-    pkt.size = 255;
-
-    // Do the packet stuff - setting MHDR
-    pkt.payload[0] = 0xE0; // MHDR - Set as PRP
-    pkt.payload[1] = 0xAA; // FHDR - DevAddr[0] 
-    pkt.payload[2] = 0xBB; // FHDR - DevAddr[1] 
-    pkt.payload[3] = 0xBB; // FHDR - DevAddr[2]
-    pkt.payload[4] = 0xAA; // FHDR - DevAddr[3]
-    pkt.payload[5] = 0xA0; // FCtrl - set as an ACK and ADR
-    pkt.payload[6] = 0x01; // FCnt[0]
-    pkt.payload[7] = 0x00; // FCnt[1]
-    pkt.payload[8] = 0x69; // Funny number FPort
-
-    for (int i = 9; i < 255; i++)
-        pkt.payload[i] = i;
-
-
-}
-
-/**
- * Test function that waits on server stinker to send commands to perform actions.
- * '-' indicate non important slots, 'x' indicates where to place values
- * Commands include:
- * {'T', 'X', x, -, -} - changes transmission power
- * {'S', 'F', x, -, -} - changes spreading factor
- * {'F', 'C', 'T', x, x} - changes the FCnt and sends a transmission (arrange FCnt as normal)
- * Send the following command to leave the function
- * {'e', 'x', 'i', 't', '\0'}
-*/
-void test_stinker_instructed(int socket) {
-
-    /* Variables for packet transmission*/
-    struct lgw_pkt_tx_s pkt;
-    uint8_t tx_status;
-    uint32_t new_dr = DR_LORA_SF7;
-    int8_t new_tx = 12;
-    uint16_t fcnt = 0;
-
-    /* Socket related variables */
-    int valread;
-    char buffer[5] = { 0 };
-
-    /* Return checking variable */
-    int i;
-
-    pkt.freq_hz = 916800000;
-    pkt.tx_mode = 0; // Send transmission immediately
-    pkt.rf_chain = 0; // Radio 0 - its the only one with transmissions enabled
-    pkt.rf_power = new_tx;
-    pkt.modulation = MOD_LORA;
-    pkt.bandwidth = BW_125KHZ;
-    pkt.datarate = new_dr; // SLOW
-    pkt.coderate = CR_LORA_4_5;
-
-    // Packet characteristics
-    pkt.preamble = 8; // Standard LoRa preamble for SF7-12
-    pkt.no_crc = false;
-    pkt.no_header = false;
-    pkt.size = 255;
+    pkt.size = 17;
 
     // Do the packet stuff - setting MHDR
     pkt.payload[0] = 0xE0; // MHDR - Set as PRP
@@ -1190,111 +1395,20 @@ void test_stinker_instructed(int socket) {
     pkt.payload[7] = 0x00; // FCnt[1]
     pkt.payload[8] = 0x69; // Funny number FPort
 
-    for (int i = 9; i < 255; i++)
+    for (i = 9; i < 17; i++)
         pkt.payload[i] = i;
 
-    valread = read(socket, buffer, sizeof(buffer));
-    while ((!exit_sig && !quit_sig) && strcmp("exit", buffer)) {
-        
-        if (valread < 1) {
-            MSG_INFO("Something went wrong %d\n", valread);
-            break;
-        } else {
-            if (buffer[0] == 'F' && buffer[1] == 'C' && buffer[2] == 'T') {
-                // Change the FCnt
-                fcnt = buffer[4] << 8 | buffer[3];
-                pkt.payload[6] = fcnt & 0x00FF;
-                pkt.payload[7] = fcnt >> 8;
-                pkt.datarate = new_dr;
-                pkt.rf_power = new_tx;
-
-                i = lgw_status(pkt.rf_chain, 1, &tx_status);
-                if (tx_status == TX_FREE) {
-                    i = lgw_send(&pkt);
-                    if (i != LGW_HAL_SUCCESS) {
-                        MSG_ERR("failed to send for some reason\n");
-                    } else {
-                        // Do nothing
-                    }
-                }
-            } else if (buffer[0] == 'S' && buffer[1] == 'F') {
-                // Change the SF
-                new_dr = (uint32_t)buffer[2];
-                MSG_INFO("Spreading Factor %d now active\n", new_dr);
-            } else if (buffer[0] == 'T' && buffer[1] == 'X') {
-                // Change the Tx power
-                new_tx = (int8_t)buffer[2];
-                MSG_INFO("Transmission power now at %ddBm\n", new_tx);
-            }
-        }
-
-        valread = read(socket, buffer, sizeof(buffer));
+    airtime = (pkt.size + 8 + 4.25 + 8 + 2) * 8;
+    switch (pkt.datarate) {
+        case DR_LORA_SF7:   airtime = airtime / BITRATE_DR5; break;
+        case DR_LORA_SF8:   airtime = airtime / BITRATE_DR4; break;
+        case DR_LORA_SF9:   airtime = airtime / BITRATE_DR3; break;
+        case DR_LORA_SF10:  airtime = airtime / BITRATE_DR2; break;
+        case DR_LORA_SF11:  airtime = airtime / BITRATE_DR1; break;
+        case DR_LORA_SF12:  airtime = airtime / BITRATE_DR0; break;
+        default:            MSG_ERR("Unknown spreading factor found");
     }
-}
-
-/* -------------------------------------------------------------------------- */
-/* --- MAIN FUNCTION -------------------------------------------------------- */
-
-int main(int argc, char **argv) {
-
-    /* return management variable */
-    int i, result;
-    uint8_t tx_status;
-
-    /* Socket variables */
-    int status, valread, client_fd;
-    struct sockaddr_in serv_addr;
-    char buffer[5] = { 0 };
-
-    /* configuration file related */
-    const char defaut_conf_fname[] = JSON_CONF_DEFAULT;
-    const char * conf_fname = defaut_conf_fname; /* pointer to a string we won't touch */
-
-    uint32_t new_dr = DR_LORA_SF7;  // Set to default SF7
-    int8_t new_tx = 12;             // Set to lowest TX power
-
-    /* deamonise handling variables */
-    pid_t pid;
-    bool daemonise = false;
-    uint16_t fcnt = 0;
-    uint8_t power = 0;
-
-    char file_helper[50];
-
-    unsigned long wait_time = 0;
-
-    /* transmitting packet */
-    struct lgw_pkt_tx_s pkt;
-
-    /* Create the transmission packet */
-    pkt.freq_hz = 916800000;
-    pkt.tx_mode = 0; // Send transmission immediately
-    pkt.rf_chain = 0; // Radio 0 - its the only one with transmissions enabled
-    pkt.rf_power = new_tx;
-    pkt.modulation = MOD_LORA;
-    pkt.bandwidth = BW_125KHZ;
-    pkt.datarate = new_dr;
-    pkt.coderate = CR_LORA_4_5;
-
-    // Packet characteristics
-    pkt.preamble = 8; // Standard LoRa preamble for SF7-12
-    pkt.no_crc = false;
-    pkt.no_header = false;
-    pkt.size = 255;
-
-    // Do the packet stuff - setting MHDR
-    pkt.payload[0] = 0xE0; // MHDR - Set as PRP
-    pkt.payload[1] = 0x12; // FHDR - DevAddr[0] 
-    pkt.payload[2] = 0x34; // FHDR - DevAddr[1] 
-    pkt.payload[3] = 0x56; // FHDR - DevAddr[2]
-    pkt.payload[4] = 0x78; // FHDR - DevAddr[3]
-    pkt.payload[5] = 0xA0; // FCtrl - set as an ACK and ADR
-    pkt.payload[6] = 0x01; // FCnt[0]
-    pkt.payload[7] = 0x00; // FCnt[1]
-    pkt.payload[8] = 0x69; // Funny number FPort
-
-    for (int i = 9; i < 255; i++)
-        pkt.payload[i] = i;
+    packet_airtime_ms = (long int)(airtime * 1e3);
 
     /* parse command line options */
     while( (i = getopt( argc, argv, OPTION_ARGS )) != -1 )
@@ -1339,7 +1453,7 @@ int main(int argc, char **argv) {
     }
 
     /* opening log file */
-    log_open("stinker_client");
+    log_open("stinker_server");
 
     /* check device can open shells with system function */
     i = system(NULL);
@@ -1362,6 +1476,12 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
+    /* starting the concentrator */
+    if (sniffer_start()) {
+        MSG_ERR("[main] Failed to start sniffer\n");
+        exit(EXIT_FAILURE);
+    }
+
     /* configure signal handling */
     sigemptyset(&sigact.sa_mask);
     sigact.sa_flags = 0;
@@ -1370,96 +1490,82 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sigact, NULL); /* Ctrl-C */
     sigaction(SIGTERM, &sigact, NULL); /* default "kill" command */
 
-    /* starting the concentrator */
-    if (sniffer_start()) {
-        MSG_ERR("[main] Failed to start sniffer\n");
+    /* Get ready for socket handling */
+    /* Creating socket file descriptor */
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+        perror("socket failed");
+        exit(EXIT_FAILURE);
+    }
+  
+    // Forcefully attaching socket to the port 8080
+    if (setsockopt(server_fd, SOL_SOCKET,
+                   SO_REUSEADDR | SO_REUSEPORT, &opt,
+                   sizeof(opt))) {
+        perror("setsockopt");
+        exit(EXIT_FAILURE);
+    }
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
+  
+    // Forcefully attaching socket to the port 8080
+    if (bind(server_fd, (struct sockaddr*)&address,
+             sizeof(address))
+        < 0) {
+        perror("bind failed");
+        exit(EXIT_FAILURE);
+    }
+    if (listen(server_fd, 3) < 0) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+    if ((new_socket
+         = accept(server_fd, (struct sockaddr*)&address,
+                  (socklen_t*)&addrlen))
+        < 0) {
+        perror("accept");
         exit(EXIT_FAILURE);
     }
 
-    /* get the socket ready */
-    if ((client_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        printf("\n Socket creation error \n");
-        return -1;
-    }
-  
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
-  
-    // Convert IPv4 and IPv6 addresses from text to binary
-    // form
-    if (inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr)
-        <= 0) {
-        printf(
-            "\nInvalid address/ Address not supported \n");
-        return -1;
-    }
-  
-    if ((status
-         = connect(client_fd, (struct sockaddr*)&serv_addr,
-                   sizeof(serv_addr)))
-        < 0) {
-        printf("\nConnection Failed \n");
-        return -1;
-    }
+    sprintf(file_helper, "demo_showcase_scaled_jamming");
+    log_open(file_helper);
 
-    // Setting MAC address if a serpate radio DevAddr is needed
-    pkt.payload[1] = 0xAA; // FHDR - DevAddr[0] 
-    pkt.payload[2] = 0xBB; // FHDR - DevAddr[1] 
-    pkt.payload[3] = 0xBB; // FHDR - DevAddr[2]
-    pkt.payload[4] = 0xAA; // FHDR - DevAddr[3]
+    /* Set test duration */
+    test_duration_secs = 20;
+    /* Set frame counters */
+    fcnt = 1; 
+    fcnt_client = 1;
 
-    /* Test for SF and TX */
-    valread = read(client_fd, buffer, sizeof(buffer));
-    while ((!exit_sig && !quit_sig) && strcmp("exit", buffer)) {
+    for (int j = 0; j < 3; j++) {
+        buffer_tx[2] = 12;
+        send(new_socket, buffer_tx, sizeof(buffer_tx), 0);
+
+        MSG_INFO("Loop %d\n", j);
+        packets_per_minute = 64;
+        wait_time_ms = (long)(ms_per_minute / packets_per_minute);
         
-        if (valread < 1) {
-            MSG_INFO("Something went wrong %d\n", valread);
-            break;
-        } else {
-            //MSG_INFO("Buffer was [%c, %c, %c, %d, %d]\n", buffer[0], buffer[1], buffer[2],buffer[3], buffer[4]);
-            if (buffer[0] == 'F' && buffer[1] == 'C' && buffer[2] == 'T') {
-                // Change the FCnt
-                //fcnt = buffer[4] << 8 | buffer[3];
-                
-                // pkt.payload[6] = fcnt & 0x00FF;
-                // pkt.payload[7] = fcnt >> 8;
+        while (wait_time_ms > packet_airtime_ms) {
 
-                i = lgw_status(pkt.rf_chain, 1, &tx_status);
-                if (tx_status == TX_FREE) {
-                    pkt.payload[6] = buffer[3];
-                    pkt.payload[7] = buffer[4];
-                    pkt.datarate = new_dr;
-                    pkt.rf_power = new_tx;
+            MSG_INFO("PPM: %d. Delay %lums\n", packets_per_minute, wait_time_ms);
+            
+            for (int j = 27; j > 26; j--) {
+                pkt.rf_power = j;
 
-                    i = lgw_send(&pkt);
-                    if (i != LGW_HAL_SUCCESS) {
-                        MSG_ERR("failed to send for some reason\n");
-                    } else {
-                        // Do nothing
-                    }
-                }
-            } else if (buffer[0] == 'S' && buffer[1] == 'F') {
-                // Change the SF
-                new_dr = (uint32_t)buffer[2];
-                MSG_INFO("Spreading Factor %d now active\n", new_dr);
-            } else if (buffer[0] == 'T' && buffer[1] == 'X') {
-                // Change the Tx power
-                new_tx = (int8_t)buffer[2];
-                MSG_INFO("Transmission power now at %ddBm\n", new_tx);
+                jamming_scaling(&pkt, new_socket, 17, test_duration_secs, wait_time_ms, 3000, &fcnt, &fcnt_client);
+
+                wait_ms(test_duration_secs * 1000);
+
+                if (exit_sig || quit_sig) // Code to exit
+                    interrupt_cleanup(new_socket, server_fd);
             }
-        }
 
-        valread = read(client_fd, buffer, sizeof(buffer));
+            packets_per_minute *= scaler;                               // Packets per minute as per scaler
+            wait_time_ms = (long)(ms_per_minute / packets_per_minute);  // Update the wait time
+        }
     }
 
-    close(client_fd);
-
-    wait_ms(10000); // Plenty of time to wait for anything to finish up
-
-    sniffer_stop();
-    MSG_INFO("Successfully exited our packet stinker program\n");
-
-    return EXIT_SUCCESS;
+    /* Send exit cmd to client sniffer and cleanup here */
+    interrupt_cleanup(new_socket, server_fd);
 }  
 
 /* --- EOF ------------------------------------------------------------------ */

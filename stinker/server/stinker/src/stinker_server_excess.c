@@ -1,4 +1,7 @@
 // Cleaning up the stinker_server for the sake of demo, don't want my ugly code
+// Im so sorry its a mess, having to cook this thing up last minute due to the college
+// testing plan falling through was awful
+// Maybe you will find something useful here :)
 
     // Original code with comments, will need to clean
     test_duration_secs = 20;
